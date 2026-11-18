@@ -1,0 +1,34 @@
+{
+  "areas": [
+    {
+      "area_id": "central_delhi",
+      "name": "Central Delhi",
+      "latitude": 28.61,
+      "longitude": 77.21
+    },
+    {
+      "area_id": "noida",
+      "name": "Noida",
+      "latitude": 28.54,
+      "longitude": 77.39
+    },
+    {
+      "area_id": "gurugram",
+      "name": "Gurugram",
+      "latitude": 28.46,
+      "longitude": 77.03
+    },
+    {
+      "area_id": "ghaziabad",
+      "name": "Ghaziabad",
+      "latitude": 28.67,
+      "longitude": 77.42
+    },
+    {
+      "area_id": "faridabad",
+      "name": "Faridabad",
+      "latitude": 28.41,
+      "longitude": 77.31
+    }
+  ]
+}
