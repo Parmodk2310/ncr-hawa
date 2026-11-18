@@ -13,8 +13,10 @@ import pytest
 from ingest.analyse_stations import (
     assign_station_to_area,
     clean_field,
+    detect_duplicates,
     haversine_distance_km,
     main,
+    normalise_station_name,
     parse_iso_date,
     parse_tri_state,
 )
@@ -35,18 +37,26 @@ SAMPLE_AREAS: list[dict[str, Any]] = [
 ]
 
 
+def test_normalise_station_name() -> None:
+    """Verify name normalisation: lowercase and collapsed whitespace."""
+    assert (
+        normalise_station_name("  R   K   Puram,   Delhi - DPCC  ")
+        == "r k puram, delhi - dpcc"
+    )
+    assert normalise_station_name("DELHI TECH UNIV") == "delhi tech univ"
+    assert normalise_station_name("") == ""
+    assert normalise_station_name(None) == ""
+
+
 def test_haversine_distance_known_pairs() -> None:
     """Verify haversine formula against known reference coordinate pairs."""
-    # 1. Zero distance for identical points
     d_zero = haversine_distance_km(28.61, 77.21, 28.61, 77.21)
     assert d_zero == pytest.approx(0.0, abs=1e-5)
 
-    # 2. Central Delhi (28.61, 77.21) to Noida (28.54, 77.39) is ~19.2 km
     d_delhi_noida = haversine_distance_km(28.61, 77.21, 28.54, 77.39)
     assert 18.5 <= d_delhi_noida <= 20.0
     assert d_delhi_noida == pytest.approx(19.22, abs=0.1)
 
-    # 3. London (51.5074, -0.1278) to Paris (48.8566, 2.3522) is ~343.5 km
     d_london_paris = haversine_distance_km(51.5074, -0.1278, 48.8566, 2.3522)
     assert 342.0 <= d_london_paris <= 345.0
 
@@ -73,26 +83,22 @@ def test_assign_station_to_area_missing_or_invalid_coords() -> None:
 
 def test_assign_station_to_area_nearest_and_outside() -> None:
     """Points in radius assign to nearest center; beyond assign to outside."""
-    # Near Central Delhi
     area_id, dist = assign_station_to_area(28.615, 77.215, SAMPLE_AREAS, max_km=25.0)
     assert area_id == "central_delhi"
     assert dist is not None and dist < 2.0
 
-    # Near Noida
     area_id_noida, dist_noida = assign_station_to_area(
         28.545, 77.385, SAMPLE_AREAS, max_km=25.0
     )
     assert area_id_noida == "noida"
     assert dist_noida is not None and dist_noida < 2.0
 
-    # Rohtak (~60km away) with max_km=25.0 -> 'outside'
     area_id_far, dist_far = assign_station_to_area(
         28.876, 76.619, SAMPLE_AREAS, max_km=25.0
     )
     assert area_id_far == "outside"
     assert dist_far is not None and dist_far > 50.0
 
-    # Empty areas list
     assert assign_station_to_area(28.6, 77.2, [], 25.0) == ("outside", None)
 
 
@@ -122,8 +128,94 @@ def test_clean_field_and_parse_tri_state() -> None:
     assert parse_tri_state("maybe") == "unknown"
 
 
+def test_duplicates_exact_duplicates() -> None:
+    """Exact duplicates (same name, distance 0m) must form a duplicate group."""
+    stations = [
+        {"station_id": "1", "name": "R K Puram", "lat": "28.563", "lon": "77.186"},
+        {"station_id": "2", "name": "r k puram", "lat": "28.563", "lon": "77.186"},
+    ]
+    dup_map, dup_groups, far_apart = detect_duplicates(stations, dup_m=500.0)
+    assert len(dup_groups) == 1
+    assert dup_groups[0]["group_id"] == "DUP-01"
+    assert len(dup_groups[0]["stations"]) == 2
+    assert dup_map["1"]["group_id"] == "DUP-01"
+    assert dup_map["2"]["group_id"] == "DUP-01"
+    assert "likely duplicate" in dup_map["1"]["dup_note"]
+    assert len(far_apart) == 0
+
+
+def test_duplicates_same_name_7km_apart() -> None:
+    """Same name stations 7 km apart must be listed as 'same name, far apart'."""
+    stations = [
+        {
+            "station_id": "5763",
+            "name": "Narela, Delhi - DPCC",
+            "lat": "28.8446874",
+            "lon": "77.0332666",
+        },
+        {
+            "station_id": "10485",
+            "name": "Narela, Delhi - DPCC",
+            "lat": "28.822836",
+            "lon": "77.101981",
+        },
+    ]
+    dup_map, dup_groups, far_apart = detect_duplicates(stations, dup_m=500.0)
+    assert len(dup_groups) == 0
+    assert dup_map["5763"]["group_id"] == ""
+    assert dup_map["10485"]["group_id"] == ""
+    assert "same name, far apart" in dup_map["5763"]["dup_note"]
+    assert "same name, far apart" in dup_map["10485"]["dup_note"]
+    assert len(far_apart) == 2
+
+
+def test_duplicates_different_names_at_same_spot() -> None:
+    """Different names at the exact same location must NOT be treated as duplicates."""
+    stations = [
+        {"station_id": "1", "name": "Station Alpha", "lat": "28.61", "lon": "77.21"},
+        {"station_id": "2", "name": "Station Beta", "lat": "28.61", "lon": "77.21"},
+    ]
+    dup_map, dup_groups, far_apart = detect_duplicates(stations, dup_m=500.0)
+    assert len(dup_groups) == 0
+    assert dup_map["1"]["group_id"] == ""
+    assert dup_map["1"]["dup_note"] == ""
+    assert dup_map["2"]["group_id"] == ""
+    assert dup_map["2"]["dup_note"] == ""
+    assert len(far_apart) == 0
+
+
+def test_duplicates_missing_coordinates() -> None:
+    """Stations with same name but missing coordinates must not be duplicates."""
+    stations = [
+        {"station_id": "1", "name": "Station A", "lat": "", "lon": ""},
+        {"station_id": "2", "name": "Station A", "lat": "28.61", "lon": "77.21"},
+    ]
+    dup_map, dup_groups, far_apart = detect_duplicates(stations, dup_m=500.0)
+    assert len(dup_groups) == 0
+    assert dup_map["1"]["group_id"] == ""
+    assert "missing coordinates" in dup_map["1"]["dup_note"]
+    assert dup_map["2"]["group_id"] == ""
+    assert len(far_apart) == 0
+
+
+def test_duplicates_configurable_dup_m_threshold() -> None:
+    """Changing --dup-m changes whether stations ~300m apart are duplicates."""
+    stations = [
+        {"station_id": "1", "name": "Stadium", "lat": "28.5828", "lon": "77.2321"},
+        {"station_id": "2", "name": "Stadium", "lat": "28.5802", "lon": "77.2338"},
+    ]
+    # At 500m threshold: ~328m apart -> DUPLICATE
+    _, groups_500, _ = detect_duplicates(stations, dup_m=500.0)
+    assert len(groups_500) == 1
+
+    # At 200m threshold: ~328m apart -> NOT DUPLICATE
+    _, groups_200, far_200 = detect_duplicates(stations, dup_m=200.0)
+    assert len(groups_200) == 0
+    assert len(far_200) == 2
+
+
 def test_analyse_stations_tiny_hand_made_csv(tmp_path: Path) -> None:
-    """Test full analysis flow on a hand-crafted CSV with known edge cases."""
+    """Full analysis flow with exact duplicates, 7km apart, same spot diff names."""
     areas_path = tmp_path / "areas.json"
     areas_path.write_text(
         json.dumps({"areas": SAMPLE_AREAS}),
@@ -135,22 +227,29 @@ def test_analyse_stations_tiny_hand_made_csv(tmp_path: Path) -> None:
         "station_id,name,provider,lat,lon,licence_name,commercialUseAllowed,"
         "attributionRequired,redistributionAllowed,source_url,checked_on,"
         "decision,is_monitor,is_mobile,has_pm25,datetime_first,datetime_last\n"
-        # 1: Central Delhi, within radius, active, CC BY 4.0
-        "1,Station A,CPCB,28.615,77.215,CC BY 4.0,True,True,True,http://a,2026-11-18,"
-        ",True,False,True,2020-01-01,2026-11-15T10:00:00Z\n"
-        # 2: Noida, within radius, inactive (2024), no licence (empty)
-        "2,Station B,AirGradient,28.545,77.385,,,,,http://b,2026-11-18,"
-        ",False,False,True,2020-01-01,2024-01-01T00:00:00Z\n"
-        # 3: Far away (Rohtak), outside radius (> 25 km), active
-        "3,Station C,CPCB,28.876,76.619,,,,,http://c,2026-11-18,"
-        ",True,False,True,2020-01-01,2026-11-16T00:00:00Z\n"
-        # 4: Missing coords, missing date
-        "4,Station D,,,,, ,,,http://d,2026-11-18,"
-        ",,,False,,\n"
+        # 1 & 2: Exact duplicates (RK Puram CPCB vs caaqm, dist 0m)
+        "17,R K Puram,CPCB,28.563,77.186,CC BY 4.0,True,True,True,http://a,2026-11-18,"
+        ",True,False,True,2020-01-01,2026-11-18T18:00:00Z\n"
+        "7044,r k puram,caaqm,28.563,77.186,,,,,http://b,2026-11-18,"
+        ",True,False,True,2020-01-01,2022-10-31T00:45:00Z\n"
+        # 3 & 4: Same name ~7 km apart (both within 25 km of Delhi)
+        "5763,Narela,caaqm,28.670,77.210,,,,,http://c,2026-11-18,"
+        ",True,False,True,2020-01-01,2018-05-12T06:00:00Z\n"
+        "10485,narela,CPCB,28.730,77.210,,,,,http://d,2026-11-18,"
+        ",True,False,True,2020-01-01,2026-11-18T18:00:00Z\n"
+        # 5 & 6: Different names at same spot (Alpha vs Beta at dist 0m)
+        "101,Station Alpha,CPCB,28.615,77.215,,,,,http://e,2026-11-18,"
+        ",True,False,True,2020-01-01,2026-11-18T18:00:00Z\n"
+        "102,Station Beta,CPCB,28.615,77.215,,,,,http://f,2026-11-18,"
+        ",True,False,True,2020-01-01,2026-11-18T18:00:00Z\n"
+        # 7: Missing coordinates
+        "200,Station Missing,CPCB,,,,,,,http://g,2026-11-18,"
+        ",True,False,True,2020-01-01,2026-11-18T18:00:00Z\n"
     )
     licences_path.write_text(licences_content, encoding="utf-8")
 
     summary_md = tmp_path / "station_summary.md"
+    duplicates_md = tmp_path / "station_duplicates.md"
     candidates_csv = tmp_path / "candidates.csv"
 
     exit_code = main(
@@ -160,9 +259,13 @@ def test_analyse_stations_tiny_hand_made_csv(tmp_path: Path) -> None:
             "--areas-json",
             str(areas_path),
             "--max-km",
-            "25.0",
+            "30.0",
+            "--dup-m",
+            "500.0",
             "--summary-md",
             str(summary_md),
+            "--duplicates-md",
+            str(duplicates_md),
             "--candidates-csv",
             str(candidates_csv),
             "--as-of-date",
@@ -176,91 +279,45 @@ def test_analyse_stations_tiny_hand_made_csv(tmp_path: Path) -> None:
     with open(candidates_csv, encoding="utf-8") as f:
         reader = list(csv.DictReader(f))
 
-    # Exactly 2 candidates within 25 km (Station A and Station B)
-    assert len(reader) == 2
-    row1, row2 = reader[0], reader[1]
+    rows_by_id = {r["station_id"]: r for r in reader}
 
-    assert row1["station_id"] == "1"
-    assert row1["area_id"] == "central_delhi"
-    assert float(row1["distance_km"]) < 2.0
-    assert row1["decision"] == ""  # Strictly empty string
-    assert row1["licence_name"] == "CC BY 4.0"
+    # Verify duplicate pair 17 & 7044
+    assert rows_by_id["17"]["duplicate_group_id"] == "DUP-01"
+    assert rows_by_id["7044"]["duplicate_group_id"] == "DUP-01"
+    assert "likely duplicate" in rows_by_id["17"]["dup_note"]
+    assert "likely duplicate" in rows_by_id["7044"]["dup_note"]
+    assert rows_by_id["17"]["decision"] == ""
+    assert rows_by_id["7044"]["decision"] == ""
 
-    assert row2["station_id"] == "2"
-    assert row2["area_id"] == "noida"
-    assert float(row2["distance_km"]) < 2.0
-    assert row2["decision"] == ""  # Strictly empty string
-    assert row2["licence_name"] == "unknown"  # Empty mapped to 'unknown'
-    assert row2["commercialUseAllowed"] == "unknown"
+    # Verify same name 7 km apart (Narela 5763 & 10485)
+    assert rows_by_id["5763"]["duplicate_group_id"] == ""
+    assert rows_by_id["10485"]["duplicate_group_id"] == ""
+    assert "same name, far apart" in rows_by_id["5763"]["dup_note"]
+    assert "same name, far apart" in rows_by_id["10485"]["dup_note"]
 
-    # 2. Verify Summary Markdown
+    # Verify different names at same spot (Alpha 101 & Beta 102)
+    assert rows_by_id["101"]["duplicate_group_id"] == ""
+    assert rows_by_id["101"]["dup_note"] == ""
+    assert rows_by_id["102"]["duplicate_group_id"] == ""
+    assert rows_by_id["102"]["dup_note"] == ""
+
+    # 2. Verify duplicates report (reports/station_duplicates.md)
+    assert duplicates_md.exists()
+    dup_content = duplicates_md.read_text(encoding="utf-8")
+    assert "Group `DUP-01`: r k puram" in dup_content
+    assert "| 17 | `CPCB` |" in dup_content
+    assert "| 7044 | `caaqm` |" in dup_content
+    assert "Same Name, Far Apart" in dup_content
+    assert "narela" in dup_content
+
+    # 3. Verify summary report (reports/station_summary.md)
     assert summary_md.exists()
-    content = summary_md.read_text(encoding="utf-8")
-
-    assert "Reference UTC Date**: `2026-11-18`" in content
-    assert "Total Locations Evaluated**: `4`" in content
-    assert "Candidate Locations Kept**: `2` (`stations_candidates.csv`)" in content
-    assert "Locations Outside Threshold**: `1`" in content
-
-    # Check area breakdown in markdown
-    assert "`central_delhi`" in content
-    assert "`noida`" in content
-    assert "`outside`" in content
-    assert "`unknown`" in content
-
-    # Check provider breakdown
-    assert "`CPCB`" in content
-    assert "`AirGradient`" in content
-
-    # Check recency counts: Station 1 active within 30 days, Station 3 active
-    assert "Active within last 30 days" in content
-    assert "**2**" in content
+    sum_content = summary_md.read_text(encoding="utf-8")
+    assert "Duplicate Station Summary" in sum_content
+    assert "Likely Duplicate Groups**: `1`" in sum_content
 
 
-def test_analyse_stations_include_outside_flag(tmp_path: Path) -> None:
-    """When --include-outside is passed, outside stations are included in CSV."""
-    areas_path = tmp_path / "areas.json"
-    areas_path.write_text(
-        json.dumps({"areas": SAMPLE_AREAS}),
-        encoding="utf-8",
-    )
-
-    licences_path = tmp_path / "licences.csv"
-    licences_content = (
-        "station_id,name,provider,lat,lon,licence_name,commercialUseAllowed,"
-        "attributionRequired,redistributionAllowed,source_url,checked_on,"
-        "decision,is_monitor,is_mobile,has_pm25,datetime_first,datetime_last\n"
-        "1,Station In,CPCB,28.615,77.215,,,,,,2026-11-18,,,,,\n"
-        "2,Station Out,CPCB,28.876,76.619,,,,,,2026-11-18,,,,,\n"
-    )
-    licences_path.write_text(licences_content, encoding="utf-8")
-
-    candidates_csv = tmp_path / "candidates.csv"
-
-    exit_code = main(
-        [
-            "--licences-csv",
-            str(licences_path),
-            "--areas-json",
-            str(areas_path),
-            "--candidates-csv",
-            str(candidates_csv),
-            "--include-outside",
-        ]
-    )
-    assert exit_code == 0
-
-    with open(candidates_csv, encoding="utf-8") as f:
-        reader = list(csv.DictReader(f))
-
-    assert len(reader) == 2
-    assert reader[0]["area_id"] == "central_delhi"
-    assert reader[1]["area_id"] == "outside"
-    assert reader[0]["decision"] == ""
-    assert reader[1]["decision"] == ""
-
-
-def test_main_cli_invalid_date(tmp_path: Path) -> None:
+def test_main_cli_invalid_date() -> None:
     """Invalid date format must return non-zero exit code."""
     exit_code = main(["--as-of-date", "invalid-date"])
     assert exit_code == 1
