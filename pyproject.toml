@@ -1,0 +1,31 @@
+[project]
+name = "ncr-hawa"
+version = "0.1.0"
+description = "Delhi-NCR Air Quality Forecast"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.2.0",
+    "ruff==0.17.5",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+exclude = [
+    "docs",
+    "AGENTS.md",
+    "README.md",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = []
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
