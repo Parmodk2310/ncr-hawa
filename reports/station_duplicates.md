@@ -1,14 +1,14 @@
-# Station Duplicate Detection Report (Task A-003b)
+# Station Duplicate Detection Report (500 m Threshold)
 
 ## Overview
 - **Input Licences File**: `data/licences.csv`
-- **Distance Threshold (`--dup-m`)**: `500.0 m` (maintainer guess)
+- **Distance Threshold (`--dup-m`)**: `500 m` (maintainer guess)
 - **Total Locations Evaluated**: `144`
 - **Likely Duplicate Groups Found**: `13`
 - **Total Duplicate Stations**: `27`
 - **Same-Name Stations Separated Beyond Threshold**: `24`
 
-## 1. Likely Duplicate Groups (Distance <= 500 m, Same Normalised Name)
+## 1. Likely Duplicate Groups (<= 500 m, Same Name)
 
 ### Group `DUP-01`: r k puram, delhi - dpcc
 - **Stations in Group**: `2`
@@ -130,7 +130,7 @@
 
 ## 2. Same Name, Far Apart (> 500 m)
 
-These stations share identical normalised names but are located farther apart than `500.0 m`. Per project rules, they are **not** treated as duplicates.
+These stations share identical normalised names but are located farther apart than `500 m`. Per project rules, they are **not** treated as duplicates.
 
 | Station ID | Normalised Name | Provider | Closest Counterpart | Distance Apart | datetime_last |
 |---|---|---|---|---|---|

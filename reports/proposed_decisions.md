@@ -1,0 +1,92 @@
+# Proposed Station Decisions Report (Task A-003c)
+
+## Overview & Decision Rules
+- **Input Licences File**: `data/licences.csv`
+- **Reference UTC Date**: `2026-11-19`
+- **Active Cutoff Date (30 days)**: `2026-10-20`
+- **Total Candidate Locations**: `119`
+
+### Decision Rules Hierarchy
+The following rules were applied in strict sequential order:
+
+| Rule # | Condition | Proposed Decision | Proposed Reason | Priority / Notes |
+|---|---|---|---|---|
+| **1** | `has_pm25` is `no` or unknown | `exclude` | `no PM2.5` | Highest priority |
+| **2** | `datetime_last` missing / invalid | `review` | `last date unknown` | Evaluated second |
+| **5** | Same name as another station > 5 km apart | `review` | `same name far apart, check coordinates` | **Overrides rules 3 & 4** |
+| **3** | In duplicate group: latest member | `use` (active) / `history_only` (inactive) | `active monitor` / `no data in 30 days` | Other members: `older duplicate of <id>` |
+| **4** | `datetime_last` older than 30 days | `history_only` | `no data in 30 days` | Inactive historical stations |
+| **6** | Everything else | `use` | `active monitor` | Default for active valid monitors |
+
+> [!IMPORTANT]
+> **Publishing Policy Note (`AQ_11`)**:
+> `proposed_decision` is **never** set to `publish`.
+> A separate column `publish_candidate = yes` is set **only if** `redistributionAllowed` is `True`,
+> `licence_name` is non-blank, and `proposed_decision` is `use`.
+> **This does NOT mean publishing is allowed until the maintainer has read and verified the licence text.**
+
+## 1. Summary of Proposed Decisions
+| Proposed Decision | Station Count | Share | Description |
+|---|---|---|---|
+| `use` | 77 | 64.7% | Active monitors recommended for forecast training/evaluation |
+| `history_only` | 28 | 23.5% | Inactive (> 30 days) or older duplicates of active stations |
+| `review` | 12 | 10.1% | Stations with same name > 5 km apart or missing dates |
+| `exclude` | 2 | 1.7% | Stations without confirmed PM2.5 capability |
+| **Total** | **119** | **100.0%** | All candidate stations within radius |
+
+- **Publish Candidates (`publish_candidate = yes`)**: **11** (9.2%)
+- **Internal / Non-Publish (`publish_candidate = no`)**: **108** (90.8%)
+
+## 2. Proposed Decisions by Forecast Area
+| Area ID | Area Name | `use` | `history_only` | `review` | `exclude` | Total |
+|---|---|---|---|---|---|---|
+| `central_delhi` | Central Delhi | 40 | 20 | 6 | 2 | **68** |
+| `noida` | Noida | 10 | 0 | 2 | 0 | **12** |
+| `gurugram` | Gurugram | 11 | 0 | 4 | 0 | **15** |
+| `ghaziabad` | Ghaziabad | 11 | 5 | 0 | 0 | **16** |
+| `faridabad` | Faridabad | 5 | 3 | 0 | 0 | **8** |
+
+## 3. Stations Requiring Manual Review (`review`)
+Total stations flagged for review: **12**
+
+| Station ID | Name | Area ID | Distance (km) | Reason | datetime_last |
+|---|---|---|---|---|---|
+| 15 | IGI Airport | `central_delhi` | 12.62 | `last date unknown` | `unknown` |
+| 16 | Civil Lines | `central_delhi` | 7.80 | `last date unknown` | `unknown` |
+| 5743 | Rohini, Delhi - DPCC | `central_delhi` | 20.78 | `same name far apart, check coordinates` | `2018-05-12T06:30:00Z` |
+| 5759 | Sonia Vihar, Delhi - DPCC | `central_delhi` | 11.49 | `same name far apart, check coordinates` | `2018-05-12T05:00:00Z` |
+| 5760 | Dwarka-Sector 8, Delhi - DPCC | `gurugram` | 23.25 | `same name far apart, check coordinates` | `2018-05-12T05:00:00Z` |
+| 6314 | NISE Gwal Pahari, Gurugram - IMD | `gurugram` | 18.11 | `same name far apart, check coordinates` | `2018-11-16T04:00:00Z` |
+| 6931 | Dwarka-Sector 8, Delhi - DPCC | `gurugram` | 13.01 | `same name far apart, check coordinates` | `2026-11-18T18:00:00Z` |
+| 8475 | Sonia Vihar, Delhi - DPCC | `central_delhi` | 11.82 | `same name far apart, check coordinates` | `2026-11-18T18:00:00Z` |
+| 10831 | Rohini, Delhi - DPCC | `central_delhi` | 16.21 | `same name far apart, check coordinates` | `2026-11-18T18:00:00Z` |
+| 10921 | NISE Gwal Pahari, Gurugram - IMD | `gurugram` | 12.35 | `same name far apart, check coordinates` | `2026-11-18T18:00:00Z` |
+| 6551894 | A-Block Sector 51 NOIDA | `noida` | 5.08 | `last date unknown` | `unknown` |
+| 6552066 | A-Block Sector 51 NOIDA | `noida` | 5.03 | `last date unknown` | `unknown` |
+
+## 4. Preliminary Publish Candidates (`publish_candidate = yes`)
+Total publish candidate stations: **11**
+
+> [!NOTE]
+> All other stations (108) have `redistributionAllowed = unknown` or blank licences,
+> and must remain internal unless explicit permission is verified.
+
+| Station ID | Name | Provider | Licence Name | redistributionAllowed |
+|---|---|---|---|---|
+| 8118 | New Delhi | `AirNow` | `US Public Domain` | `True` |
+| 2860223 | GK1 (Oberoi Terrace) | `AirGradient` | `CC BY 4.0` | `True` |
+| 3024966 | NASA GSFC Rutgers Calib. N8 | `Clarity` | `CC0 1.0` | `True` |
+| 4663956 | Santushti Apartments, Vasant Kunj | `AirGradient` | `CC BY 4.0` | `True` |
+| 4712609 | Air Check | `AirGradient` | `CC BY 4.0` | `True` |
+| 6105800 | Sector 1, Noida extension | `AirGradient` | `CC BY 4.0` | `True` |
+| 6125489 | Uptitude Cloud Pvt Ltd - Sector 62, GGN | `AirGradient` | `CC BY 4.0` | `True` |
+| 6145551 | Anand Lok | `AirGradient` | `CC BY 4.0` | `True` |
+| 6551511 | Sector-26, Noida | `AirGradient` | `CC BY 4.0` | `True` |
+| 6551581 | Anahad Foundation | `AirGradient` | `CC BY 4.0` | `True` |
+| 6551848 | A-Block Sector 51 NOIDA | `AirGradient` | `CC BY 4.0` | `True` |
+
+## 5. Next Steps for Maintainer
+1. Open `data/stations_candidates.csv`.
+2. Inspect the `review` stations in Section 3 and confirm GPS coordinates.
+3. Copy or adjust `proposed_decision` values into the official `decision` column (`use` or `exclude`).
+4. Leave `decision` empty for any station still under verification.

@@ -19,6 +19,7 @@ from ingest.analyse_stations import (
     normalise_station_name,
     parse_iso_date,
     parse_tri_state,
+    propose_decisions,
 )
 
 SAMPLE_AREAS: list[dict[str, Any]] = [
@@ -128,128 +129,292 @@ def test_clean_field_and_parse_tri_state() -> None:
     assert parse_tri_state("maybe") == "unknown"
 
 
-def test_duplicates_exact_duplicates() -> None:
-    """Exact duplicates (same name, distance 0m) must form a duplicate group."""
-    stations = [
-        {"station_id": "1", "name": "R K Puram", "lat": "28.563", "lon": "77.186"},
-        {"station_id": "2", "name": "r k puram", "lat": "28.563", "lon": "77.186"},
-    ]
-    dup_map, dup_groups, far_apart = detect_duplicates(stations, dup_m=500.0)
-    assert len(dup_groups) == 1
-    assert dup_groups[0]["group_id"] == "DUP-01"
-    assert len(dup_groups[0]["stations"]) == 2
-    assert dup_map["1"]["group_id"] == "DUP-01"
-    assert dup_map["2"]["group_id"] == "DUP-01"
-    assert "likely duplicate" in dup_map["1"]["dup_note"]
-    assert len(far_apart) == 0
-
-
-def test_duplicates_same_name_7km_apart() -> None:
-    """Same name stations 7 km apart must be listed as 'same name, far apart'."""
+def test_rule_1_no_pm25_or_unknown() -> None:
+    """Rule 1: has_pm25 is 'no' or unknown -> 'exclude', 'no PM2.5'."""
     stations = [
         {
-            "station_id": "5763",
-            "name": "Narela, Delhi - DPCC",
-            "lat": "28.8446874",
-            "lon": "77.0332666",
+            "station_id": "1",
+            "name": "A",
+            "lat": "28.6",
+            "lon": "77.2",
+            "has_pm25": "False",
+            "datetime_last": "2026-11-18",
         },
         {
-            "station_id": "10485",
-            "name": "Narela, Delhi - DPCC",
-            "lat": "28.822836",
-            "lon": "77.101981",
+            "station_id": "2",
+            "name": "B",
+            "lat": "28.6",
+            "lon": "77.2",
+            "has_pm25": "",
+            "datetime_last": "2026-11-18",
         },
     ]
-    dup_map, dup_groups, far_apart = detect_duplicates(stations, dup_m=500.0)
-    assert len(dup_groups) == 0
-    assert dup_map["5763"]["group_id"] == ""
-    assert dup_map["10485"]["group_id"] == ""
-    assert "same name, far apart" in dup_map["5763"]["dup_note"]
-    assert "same name, far apart" in dup_map["10485"]["dup_note"]
-    assert len(far_apart) == 2
+    dup_map, dup_groups, _ = detect_duplicates(stations)
+    ref_d = date(2026, 11, 19)
+    cutoff = date(2026, 10, 20)
+    decs = propose_decisions(stations, dup_map, dup_groups, ref_d, cutoff)
+    assert decs["1"]["proposed_decision"] == "exclude"
+    assert decs["1"]["proposed_reason"] == "no PM2.5"
+    assert decs["2"]["proposed_decision"] == "exclude"
+    assert decs["2"]["proposed_reason"] == "no PM2.5"
 
 
-def test_duplicates_different_names_at_same_spot() -> None:
-    """Different names at the exact same location must NOT be treated as duplicates."""
+def test_rule_2_missing_datetime_last() -> None:
+    """Rule 2: datetime_last missing -> 'review', 'last date unknown'."""
     stations = [
-        {"station_id": "1", "name": "Station Alpha", "lat": "28.61", "lon": "77.21"},
-        {"station_id": "2", "name": "Station Beta", "lat": "28.61", "lon": "77.21"},
+        {
+            "station_id": "1",
+            "name": "A",
+            "lat": "28.6",
+            "lon": "77.2",
+            "has_pm25": "True",
+            "datetime_last": "",
+        },
+        {
+            "station_id": "2",
+            "name": "B",
+            "lat": "28.6",
+            "lon": "77.2",
+            "has_pm25": "True",
+            "datetime_last": "   ",
+        },
     ]
-    dup_map, dup_groups, far_apart = detect_duplicates(stations, dup_m=500.0)
-    assert len(dup_groups) == 0
-    assert dup_map["1"]["group_id"] == ""
-    assert dup_map["1"]["dup_note"] == ""
-    assert dup_map["2"]["group_id"] == ""
-    assert dup_map["2"]["dup_note"] == ""
-    assert len(far_apart) == 0
+    dup_map, dup_groups, _ = detect_duplicates(stations)
+    ref_d = date(2026, 11, 19)
+    cutoff = date(2026, 10, 20)
+    decs = propose_decisions(stations, dup_map, dup_groups, ref_d, cutoff)
+    assert decs["1"]["proposed_decision"] == "review"
+    assert decs["1"]["proposed_reason"] == "last date unknown"
+    assert decs["2"]["proposed_decision"] == "review"
+    assert decs["2"]["proposed_reason"] == "last date unknown"
 
 
-def test_duplicates_missing_coordinates() -> None:
-    """Stations with same name but missing coordinates must not be duplicates."""
+def test_rule_3_duplicate_group_active_and_all_inactive() -> None:
+    """Rule 3: Duplicate group resolution for active vs all-inactive groups."""
+    # Active group (Stn 1 active, Stn 2 older)
+    stns_active = [
+        {
+            "station_id": "1",
+            "name": "A",
+            "lat": "28.6",
+            "lon": "77.2",
+            "has_pm25": "True",
+            "datetime_last": "2026-11-18",
+        },
+        {
+            "station_id": "2",
+            "name": "a",
+            "lat": "28.6",
+            "lon": "77.2",
+            "has_pm25": "True",
+            "datetime_last": "2022-01-01",
+        },
+    ]
+    dup_map, dup_groups, _ = detect_duplicates(stns_active, dup_m=500.0)
+    ref_d = date(2026, 11, 19)
+    cutoff = date(2026, 10, 20)
+    decs = propose_decisions(stns_active, dup_map, dup_groups, ref_d, cutoff)
+    assert decs["1"]["proposed_decision"] == "use"
+    assert decs["1"]["proposed_reason"] == "active monitor"
+    assert decs["2"]["proposed_decision"] == "history_only"
+    assert decs["2"]["proposed_reason"] == "older duplicate of 1"
+
+    # All inactive group (Stn 3 from 2024, Stn 4 from 2022)
+    stns_inactive = [
+        {
+            "station_id": "3",
+            "name": "B",
+            "lat": "28.6",
+            "lon": "77.2",
+            "has_pm25": "True",
+            "datetime_last": "2024-01-01",
+        },
+        {
+            "station_id": "4",
+            "name": "b",
+            "lat": "28.6",
+            "lon": "77.2",
+            "has_pm25": "True",
+            "datetime_last": "2022-01-01",
+        },
+    ]
+    dup_map2, dup_groups2, _ = detect_duplicates(stns_inactive, dup_m=500.0)
+    decs2 = propose_decisions(stns_inactive, dup_map2, dup_groups2, ref_d, cutoff)
+    assert decs2["3"]["proposed_decision"] == "history_only"
+    assert decs2["3"]["proposed_reason"] == "no data in 30 days"
+    assert decs2["4"]["proposed_decision"] == "history_only"
+    assert decs2["4"]["proposed_reason"] == "older duplicate of 3"
+
+
+def test_rule_4_datetime_last_older_than_30_days() -> None:
+    """Rule 4: datetime_last > 30 days -> 'history_only', 'no data in 30 days'."""
     stations = [
-        {"station_id": "1", "name": "Station A", "lat": "", "lon": ""},
-        {"station_id": "2", "name": "Station A", "lat": "28.61", "lon": "77.21"},
+        {
+            "station_id": "1",
+            "name": "Unique Stn",
+            "lat": "28.6",
+            "lon": "77.2",
+            "has_pm25": "True",
+            "datetime_last": "2025-01-01",
+        },
     ]
-    dup_map, dup_groups, far_apart = detect_duplicates(stations, dup_m=500.0)
-    assert len(dup_groups) == 0
-    assert dup_map["1"]["group_id"] == ""
-    assert "missing coordinates" in dup_map["1"]["dup_note"]
-    assert dup_map["2"]["group_id"] == ""
-    assert len(far_apart) == 0
+    dup_map, dup_groups, _ = detect_duplicates(stations)
+    ref_d = date(2026, 11, 19)
+    cutoff = date(2026, 10, 20)
+    decs = propose_decisions(stations, dup_map, dup_groups, ref_d, cutoff)
+    assert decs["1"]["proposed_decision"] == "history_only"
+    assert decs["1"]["proposed_reason"] == "no data in 30 days"
 
 
-def test_duplicates_configurable_dup_m_threshold() -> None:
-    """Changing --dup-m changes whether stations ~300m apart are duplicates."""
+def test_rule_5_same_name_over_5km_override_rules_3_and_4() -> None:
+    """Rule 5: Same name > 5 km apart overrides rules 3 and 4 with 'review'."""
+    # Stn 1 active, Stn 2 stopped in 2018; ~7 km apart
     stations = [
-        {"station_id": "1", "name": "Stadium", "lat": "28.5828", "lon": "77.2321"},
-        {"station_id": "2", "name": "Stadium", "lat": "28.5802", "lon": "77.2338"},
+        {
+            "station_id": "1",
+            "name": "Narela",
+            "lat": "28.67",
+            "lon": "77.21",
+            "has_pm25": "True",
+            "datetime_last": "2026-11-18",
+        },
+        {
+            "station_id": "2",
+            "name": "narela",
+            "lat": "28.74",
+            "lon": "77.21",
+            "has_pm25": "True",
+            "datetime_last": "2018-05-12",
+        },
     ]
-    # At 500m threshold: ~328m apart -> DUPLICATE
-    _, groups_500, _ = detect_duplicates(stations, dup_m=500.0)
-    assert len(groups_500) == 1
+    dup_map, dup_groups, _ = detect_duplicates(stations, dup_m=500.0)
+    ref_d = date(2026, 11, 19)
+    cutoff = date(2026, 10, 20)
+    decs = propose_decisions(stations, dup_map, dup_groups, ref_d, cutoff)
 
-    # At 200m threshold: ~328m apart -> NOT DUPLICATE
-    _, groups_200, far_200 = detect_duplicates(stations, dup_m=200.0)
-    assert len(groups_200) == 0
-    assert len(far_200) == 2
+    # Both must get review, even though Stn 1 is active and Stn 2 is > 30 days old
+    assert decs["1"]["proposed_decision"] == "review"
+    assert decs["1"]["proposed_reason"] == "same name far apart, check coordinates"
+    assert decs["2"]["proposed_decision"] == "review"
+    assert decs["2"]["proposed_reason"] == "same name far apart, check coordinates"
 
 
-def test_analyse_stations_tiny_hand_made_csv(tmp_path: Path) -> None:
-    """Full analysis flow with exact duplicates, 7km apart, same spot diff names."""
+def test_rule_6_everything_else() -> None:
+    """Rule 6: Everything else -> 'use', 'active monitor'."""
+    stations = [
+        {
+            "station_id": "1",
+            "name": "Active Unique",
+            "lat": "28.6",
+            "lon": "77.2",
+            "has_pm25": "True",
+            "datetime_last": "2026-11-18",
+        },
+    ]
+    dup_map, dup_groups, _ = detect_duplicates(stations)
+    ref_d = date(2026, 11, 19)
+    cutoff = date(2026, 10, 20)
+    decs = propose_decisions(stations, dup_map, dup_groups, ref_d, cutoff)
+    assert decs["1"]["proposed_decision"] == "use"
+    assert decs["1"]["proposed_reason"] == "active monitor"
+
+
+def test_publish_candidate_logic() -> None:
+    """Verify publish_candidate=yes when redist=True, lic non-blank, dec='use'."""
+    stations = [
+        # Yes: redist True, licence non-blank, decision use
+        {
+            "station_id": "1",
+            "name": "A",
+            "lat": "28.6",
+            "lon": "77.2",
+            "has_pm25": "True",
+            "datetime_last": "2026-11-18",
+            "redistributionAllowed": "True",
+            "licence_name": "CC BY 4.0",
+        },
+        # No: licence blank
+        {
+            "station_id": "2",
+            "name": "B",
+            "lat": "28.6",
+            "lon": "77.2",
+            "has_pm25": "True",
+            "datetime_last": "2026-11-18",
+            "redistributionAllowed": "True",
+            "licence_name": "",
+        },
+        # No: redist False
+        {
+            "station_id": "3",
+            "name": "C",
+            "lat": "28.6",
+            "lon": "77.2",
+            "has_pm25": "True",
+            "datetime_last": "2026-11-18",
+            "redistributionAllowed": "False",
+            "licence_name": "CC BY 4.0",
+        },
+        # No: decision history_only (> 30 days)
+        {
+            "station_id": "4",
+            "name": "D",
+            "lat": "28.6",
+            "lon": "77.2",
+            "has_pm25": "True",
+            "datetime_last": "2020-01-01",
+            "redistributionAllowed": "True",
+            "licence_name": "CC BY 4.0",
+        },
+    ]
+    dup_map, dup_groups, _ = detect_duplicates(stations)
+    ref_d = date(2026, 11, 19)
+    cutoff = date(2026, 10, 20)
+    decs = propose_decisions(stations, dup_map, dup_groups, ref_d, cutoff)
+    assert decs["1"]["publish_candidate"] == "yes"
+    assert decs["2"]["publish_candidate"] == "no"
+    assert decs["3"]["publish_candidate"] == "no"
+    assert decs["4"]["publish_candidate"] == "no"
+
+
+def test_end_to_end_tiny_csv_full_pipeline(tmp_path: Path) -> None:
+    """Full pipeline run: duplicates, proposed decisions, empty decision."""
     areas_path = tmp_path / "areas.json"
-    areas_path.write_text(
-        json.dumps({"areas": SAMPLE_AREAS}),
-        encoding="utf-8",
-    )
+    areas_path.write_text(json.dumps({"areas": SAMPLE_AREAS}), encoding="utf-8")
 
     licences_path = tmp_path / "licences.csv"
     licences_content = (
         "station_id,name,provider,lat,lon,licence_name,commercialUseAllowed,"
         "attributionRequired,redistributionAllowed,source_url,checked_on,"
         "decision,is_monitor,is_mobile,has_pm25,datetime_first,datetime_last\n"
-        # 1 & 2: Exact duplicates (RK Puram CPCB vs caaqm, dist 0m)
-        "17,R K Puram,CPCB,28.563,77.186,CC BY 4.0,True,True,True,http://a,2026-11-18,"
+        # 1 & 2: DUP at 500m (dist 0m)
+        "1,RK Puram,CPCB,28.615,77.215,CC BY 4.0,True,True,True,http://a,2026-11-18,"
         ",True,False,True,2020-01-01,2026-11-18T18:00:00Z\n"
-        "7044,r k puram,caaqm,28.563,77.186,,,,,http://b,2026-11-18,"
+        "2,rk puram,caaqm,28.615,77.215,,,,,http://b,2026-11-18,"
         ",True,False,True,2020-01-01,2022-10-31T00:45:00Z\n"
-        # 3 & 4: Same name ~7 km apart (both within 25 km of Delhi)
-        "5763,Narela,caaqm,28.670,77.210,,,,,http://c,2026-11-18,"
+        # 3 & 4: Same name 7 km apart (override to review)
+        "3,Narela,caaqm,28.670,77.210,,,,,http://c,2026-11-18,"
         ",True,False,True,2020-01-01,2018-05-12T06:00:00Z\n"
-        "10485,narela,CPCB,28.730,77.210,,,,,http://d,2026-11-18,"
+        "4,narela,CPCB,28.730,77.210,,,,,http://d,2026-11-18,"
         ",True,False,True,2020-01-01,2026-11-18T18:00:00Z\n"
-        # 5 & 6: Different names at same spot (Alpha vs Beta at dist 0m)
-        "101,Station Alpha,CPCB,28.615,77.215,,,,,http://e,2026-11-18,"
-        ",True,False,True,2020-01-01,2026-11-18T18:00:00Z\n"
-        "102,Station Beta,CPCB,28.615,77.215,,,,,http://f,2026-11-18,"
-        ",True,False,True,2020-01-01,2026-11-18T18:00:00Z\n"
-        # 7: Missing coordinates
-        "200,Station Missing,CPCB,,,,,,,http://g,2026-11-18,"
+        # 5: No PM2.5 (Rule 1 -> exclude)
+        "5,No PM,CPCB,28.615,77.215,,,,,http://e,2026-11-18,"
+        ",True,False,False,2020-01-01,2026-11-18T18:00:00Z\n"
+        # 6: Missing datetime_last (Rule 2 -> review)
+        "6,No Date,CPCB,28.615,77.215,,,,,http://f,2026-11-18,"
+        ",True,False,True,2020-01-01,\n"
+        # 7 & 8: 700m apart (Not dup at 500m, but Dup at 1000m)
+        "7,Patparganj,caaqm,28.625,77.285,,,,,http://g,2026-11-18,"
+        ",True,False,True,2020-01-01,2018-05-13T11:30:00Z\n"
+        "8,patparganj,CPCB,28.631,77.285,,,,,http://h,2026-11-18,"
         ",True,False,True,2020-01-01,2026-11-18T18:00:00Z\n"
     )
     licences_path.write_text(licences_content, encoding="utf-8")
 
     summary_md = tmp_path / "station_summary.md"
-    duplicates_md = tmp_path / "station_duplicates.md"
+    dup_500_md = tmp_path / "station_duplicates.md"
+    dup_1000_md = tmp_path / "station_duplicates_1000m.md"
+    prop_dec_md = tmp_path / "proposed_decisions.md"
     candidates_csv = tmp_path / "candidates.csv"
 
     exit_code = main(
@@ -265,7 +430,11 @@ def test_analyse_stations_tiny_hand_made_csv(tmp_path: Path) -> None:
             "--summary-md",
             str(summary_md),
             "--duplicates-md",
-            str(duplicates_md),
+            str(dup_500_md),
+            "--duplicates-1000-md",
+            str(dup_1000_md),
+            "--proposed-decisions-md",
+            str(prop_dec_md),
             "--candidates-csv",
             str(candidates_csv),
             "--as-of-date",
@@ -281,40 +450,45 @@ def test_analyse_stations_tiny_hand_made_csv(tmp_path: Path) -> None:
 
     rows_by_id = {r["station_id"]: r for r in reader}
 
-    # Verify duplicate pair 17 & 7044
-    assert rows_by_id["17"]["duplicate_group_id"] == "DUP-01"
-    assert rows_by_id["7044"]["duplicate_group_id"] == "DUP-01"
-    assert "likely duplicate" in rows_by_id["17"]["dup_note"]
-    assert "likely duplicate" in rows_by_id["7044"]["dup_note"]
-    assert rows_by_id["17"]["decision"] == ""
-    assert rows_by_id["7044"]["decision"] == ""
+    # Decision column must be strictly empty
+    for r in reader:
+        assert r["decision"] == ""
 
-    # Verify same name 7 km apart (Narela 5763 & 10485)
-    assert rows_by_id["5763"]["duplicate_group_id"] == ""
-    assert rows_by_id["10485"]["duplicate_group_id"] == ""
-    assert "same name, far apart" in rows_by_id["5763"]["dup_note"]
-    assert "same name, far apart" in rows_by_id["10485"]["dup_note"]
+    # Check Stn 1: use, publish_candidate=yes
+    assert rows_by_id["1"]["proposed_decision"] == "use"
+    assert rows_by_id["1"]["publish_candidate"] == "yes"
 
-    # Verify different names at same spot (Alpha 101 & Beta 102)
-    assert rows_by_id["101"]["duplicate_group_id"] == ""
-    assert rows_by_id["101"]["dup_note"] == ""
-    assert rows_by_id["102"]["duplicate_group_id"] == ""
-    assert rows_by_id["102"]["dup_note"] == ""
+    # Check Stn 2: history_only, older duplicate of 1
+    assert rows_by_id["2"]["proposed_decision"] == "history_only"
+    assert "older duplicate of 1" in rows_by_id["2"]["proposed_reason"]
+    assert rows_by_id["2"]["publish_candidate"] == "no"
 
-    # 2. Verify duplicates report (reports/station_duplicates.md)
-    assert duplicates_md.exists()
-    dup_content = duplicates_md.read_text(encoding="utf-8")
-    assert "Group `DUP-01`: r k puram" in dup_content
-    assert "| 17 | `CPCB` |" in dup_content
-    assert "| 7044 | `caaqm` |" in dup_content
-    assert "Same Name, Far Apart" in dup_content
-    assert "narela" in dup_content
+    # Check Stn 3 & 4: review due to Rule 5 override
+    assert rows_by_id["3"]["proposed_decision"] == "review"
+    assert rows_by_id["4"]["proposed_decision"] == "review"
 
-    # 3. Verify summary report (reports/station_summary.md)
-    assert summary_md.exists()
-    sum_content = summary_md.read_text(encoding="utf-8")
-    assert "Duplicate Station Summary" in sum_content
-    assert "Likely Duplicate Groups**: `1`" in sum_content
+    # Check Stn 5: exclude due to Rule 1
+    assert rows_by_id["5"]["proposed_decision"] == "exclude"
+
+    # Check Stn 6: review due to Rule 2
+    assert rows_by_id["6"]["proposed_decision"] == "review"
+
+    # 2. Verify reports exist and contain expected sections
+    assert dup_500_md.exists()
+    assert dup_1000_md.exists()
+    assert prop_dec_md.exists()
+
+    prop_content = prop_dec_md.read_text(encoding="utf-8")
+    assert "| **1** | `has_pm25` is `no` or unknown" in prop_content
+    assert "| **5** | Same name as another station > 5 km apart" in prop_content
+    assert "Publishing Policy Note" in prop_content
+    assert "Proposed Decisions by Forecast Area" in prop_content
+
+    # 3. Verify that Patparganj (7 & 8) is far apart at 500m, but duplicate at 1000m
+    d500_text = dup_500_md.read_text(encoding="utf-8")
+    d1000_text = dup_1000_md.read_text(encoding="utf-8")
+    assert "patparganj" in d500_text.lower()
+    assert "Group `DUP-02`: patparganj" in d1000_text
 
 
 def test_main_cli_invalid_date() -> None:

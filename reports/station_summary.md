@@ -3,13 +3,14 @@
 ## Overview
 - **Input Licences File**: `data/licences.csv`
 - **Input Areas File**: `configs/areas.json`
-- **Reference UTC Date**: `2026-11-18`
+- **Reference UTC Date**: `2026-11-19`
 - **Distance Threshold (`--max-km`)**: `25.0 km` (maintainer guess)
 - **Duplicate Threshold (`--dup-m`)**: `500.0 m` (maintainer guess)
 - **Total Locations Evaluated**: `144`
 - **Candidate Locations Kept**: `119`
 - **Locations Outside Threshold**: `25`
-- **Duplicate Groups Detected**: `13`
+- **Duplicate Groups Detected (500m)**: `13`
+- **Duplicate Groups Detected (1000m)**: `17`
 
 ## 1. Station Distribution by Forecast Area
 | Area ID | Description / Center | Radius Limit | Station Count | Share |
@@ -58,16 +59,14 @@
 | `is_monitor` | `unknown` | 0 | 0.0% |
 
 ## 5. Data Recency (`datetime_last`)
-- **Reference Date**: `2026-11-18` (UTC)
-- **Active within last 30 days** (>= `2026-10-19`): **100**
+- **Reference Date**: `2026-11-19` (UTC)
+- **Active within last 30 days** (>= `2026-10-20`): **100**
 - **Historical only** (> 30 days old): **40**
 - **Unknown / Missing date**: **4**
 
 ## 6. Duplicate Station Summary
-- **Duplicate Distance Threshold (`--dup-m`)**: `500.0 m`
-- **Likely Duplicate Groups**: `13`
-- **Same-Name Far Apart**: `24`
-- Detailed audit available in `reports/station_duplicates.md`.
+- **Threshold 500m**: `13` duplicate groups (see `reports/station_duplicates.md`).
+- **Threshold 1000m**: `17` duplicate groups (see `reports/station_duplicates_1000m.md`).
 
 ## 7. Outside Locations (> 25 km threshold)
 Total outside locations: **25**
@@ -99,8 +98,6 @@ Total outside locations: **25**
 | 6947 | General Hospital, Mandikhera - HSPCB | CPCB | 27.9002 | 76.9938 | 62.35 |
 | 6404322 | New Anaj Mandi, Khairthal - RSPCB | N/A | 27.8015617 | 76.6365217 | 82.76 |
 
-## 8. Next Steps & Decision Guide
-1. Inspect `data/stations_candidates.csv`.
-2. Check duplicate tags (`duplicate_group_id`, `dup_note`).
-3. Fill `decision` column (`use`, `publish`, `exclude`) per `AQ_11`.
-4. Do not invent licences; unverified flags stay `unknown`.
+## 8. Proposed Decisions Summary
+- Detailed rule rationale and table in `reports/proposed_decisions.md`.
+- Review `data/stations_candidates.csv` before filling official `decision`.

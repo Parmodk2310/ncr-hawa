@@ -1,4 +1,4 @@
-"""Analyse OpenAQ station metadata and licence records for Delhi-NCR shortlist."""
+"""Analyse OpenAQ station metadata, detect duplicates, and propose decisions."""
 
 from __future__ import annotations
 
@@ -22,6 +22,9 @@ CANDIDATE_COLUMNS = [
     "distance_km",
     "duplicate_group_id",
     "dup_note",
+    "proposed_decision",
+    "proposed_reason",
+    "publish_candidate",
     "licence_name",
     "commercialUseAllowed",
     "attributionRequired",
@@ -148,15 +151,15 @@ def _fmt_pct(count: int, total: int) -> str:
 def detect_duplicates(
     stations: list[dict[str, Any]],
     dup_m: float = 500.0,
-) -> tuple[dict[str, dict[str, str]], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Detect likely duplicate stations by normalised name and distance <= dup_m.
 
     Returns:
-    - dup_map: dict of station_id -> {"group_id": str, "dup_note": str}
+    - dup_map: dict of station_id -> {group_id, dup_note, group_members}
     - dup_groups: list of duplicate group dicts
     - far_apart_cases: list of same-name stations farther than dup_m
     """
-    dup_map: dict[str, dict[str, str]] = {}
+    dup_map: dict[str, dict[str, Any]] = {}
     dup_groups: list[dict[str, Any]] = []
     far_apart_cases: list[dict[str, Any]] = []
 
@@ -172,7 +175,11 @@ def detect_duplicates(
         if len(group_stations) < 2:
             for s in group_stations:
                 sid = clean_field(s.get("station_id"))
-                dup_map[sid] = {"group_id": "", "dup_note": ""}
+                dup_map[sid] = {
+                    "group_id": "",
+                    "dup_note": "",
+                    "group_members": [],
+                }
             continue
 
         # Separate stations with valid coordinates and missing coordinates
@@ -187,6 +194,7 @@ def detect_duplicates(
                 dup_map[sid] = {
                     "group_id": "",
                     "dup_note": "same name, missing coordinates",
+                    "group_members": [],
                 }
 
         n_valid = len(valid_list)
@@ -196,6 +204,7 @@ def detect_duplicates(
                 dup_map[sid] = {
                     "group_id": "",
                     "dup_note": "same name, other station(s) missing coordinates",
+                    "group_members": [],
                 }
             continue
 
@@ -290,6 +299,7 @@ def detect_duplicates(
                             f"likely duplicate ({closest_dist:.1f} m to "
                             f"station {closest_id})"
                         ),
+                        "group_members": group_stns,
                     }
             else:
                 # Isolated station with same name but separated by > dup_m
@@ -318,6 +328,7 @@ def detect_duplicates(
                 dup_map[sid] = {
                     "group_id": "",
                     "dup_note": dup_note_str,
+                    "group_members": [],
                 }
                 far_apart_cases.append(
                     {
@@ -331,6 +342,479 @@ def detect_duplicates(
     return dup_map, dup_groups, far_apart_cases
 
 
+def generate_duplicates_markdown(
+    dup_groups: list[dict[str, Any]],
+    far_apart_cases: list[dict[str, Any]],
+    licences_csv_path: str,
+    dup_m: float,
+    total_stations: int,
+) -> str:
+    """Generate Markdown text for duplicate station report."""
+    dup_lines: list[str] = [
+        f"# Station Duplicate Detection Report ({dup_m:.0f} m Threshold)",
+        "",
+        "## Overview",
+        f"- **Input Licences File**: `{licences_csv_path}`",
+        f"- **Distance Threshold (`--dup-m`)**: `{dup_m:.0f} m` (maintainer guess)",
+        f"- **Total Locations Evaluated**: `{total_stations}`",
+        f"- **Likely Duplicate Groups Found**: `{len(dup_groups)}`",
+        f"- **Total Duplicate Stations**: "
+        f"`{sum(len(g['stations']) for g in dup_groups)}`",
+        f"- **Same-Name Stations Separated Beyond Threshold**: "
+        f"`{len(far_apart_cases)}`",
+        "",
+        f"## 1. Likely Duplicate Groups (<= {dup_m:.0f} m, Same Name)",
+        "",
+    ]
+
+    if not dup_groups:
+        dup_lines.append("No duplicate groups found within the threshold.\n")
+    else:
+        for g in dup_groups:
+            gid = g["group_id"]
+            gname = g["name"]
+            stns = g["stations"]
+            max_d = g["max_dist_m"]
+            dup_lines.extend(
+                [
+                    f"### Group `{gid}`: {gname}",
+                    f"- **Stations in Group**: `{len(stns)}`",
+                    f"- **Maximum Distance Apart**: `{max_d:.1f} m`",
+                    "",
+                    "| Station ID | Provider | Distance Apart | datetime_first | "
+                    "datetime_last | Licence Name | has_pm25 |",
+                    "|---|---|---|---|---|---|---|",
+                ]
+            )
+            for s in stns:
+                sid = clean_field(s.get("station_id"))
+                prov = clean_field(s.get("provider"))
+                dt_first = clean_field(s.get("datetime_first"))
+                dt_last = clean_field(s.get("datetime_last"))
+                lic = clean_field(s.get("licence_name"))
+                pm25 = clean_field(s.get("has_pm25"))
+
+                dist_notes = []
+                for pw in g["pairwise"]:
+                    if pw["s1_id"] == sid:
+                        dist_notes.append(f"{pw['dist_m']:.1f} m (to {pw['s2_id']})")
+                    elif pw["s2_id"] == sid:
+                        dist_notes.append(f"{pw['dist_m']:.1f} m (to {pw['s1_id']})")
+                dist_disp = "; ".join(dist_notes) if dist_notes else "0.0 m"
+
+                dup_lines.append(
+                    f"| {sid} | `{prov}` | {dist_disp} | `{dt_first}` | "
+                    f"`{dt_last}` | `{lic}` | `{pm25}` |"
+                )
+            dup_lines.append("")
+
+    dup_lines.extend(
+        [
+            f"## 2. Same Name, Far Apart (> {dup_m:.0f} m)",
+            "",
+            "These stations share identical normalised names but are located "
+            f"farther apart than `{dup_m:.0f} m`. "
+            "Per project rules, they are **not** treated as duplicates.",
+            "",
+            "| Station ID | Normalised Name | Provider | Closest Counterpart | "
+            "Distance Apart | datetime_last |",
+            "|---|---|---|---|---|---|",
+        ]
+    )
+
+    if not far_apart_cases:
+        dup_lines.append("No same-name far-apart stations found.\n")
+    else:
+        for fa in far_apart_cases:
+            s = fa["station"]
+            sid = clean_field(s.get("station_id"))
+            prov = clean_field(s.get("provider"))
+            name_disp = fa["norm_name"]
+            c_stn = fa["closest_other"]
+            c_id = clean_field(c_stn.get("station_id"))
+            d_m = fa["distance_m"]
+            d_disp = f"{d_m / 1000.0:.2f} km" if d_m >= 1000.0 else f"{d_m:.1f} m"
+            dt_l = clean_field(s.get("datetime_last"))
+            dup_lines.append(
+                f"| {sid} | `{name_disp}` | `{prov}` | Station {c_id} | "
+                f"**{d_disp}** | `{dt_l}` |"
+            )
+
+    dup_lines.extend(
+        [
+            "",
+            "## 3. Decision Guidance for Candidates CSV",
+            "1. In candidates CSV, duplicates are tagged with `duplicate_group_id` "
+            "and `dup_note`.",
+            "2. When deciding which station to keep in each duplicate group:",
+            "   - Prefer stations with active reporting (`datetime_last` in 2026).",
+            "   - Prefer reference-grade monitors (`is_monitor = True`).",
+            "   - Mark one as `use` and duplicates as `exclude` in `decision`.",
+            "3. The `decision` column remains empty for maintainer review.",
+            "",
+        ]
+    )
+    return "\n".join(dup_lines)
+
+
+def propose_decisions(
+    stations: list[dict[str, Any]],
+    dup_map: dict[str, dict[str, Any]],
+    dup_groups: list[dict[str, Any]],
+    ref_date: date,
+    cutoff_date: date,
+) -> dict[str, dict[str, str]]:
+    """Assign proposed_decision, proposed_reason, publish_candidate per station.
+
+    Rules applied in order:
+    1. has_pm25 is 'no' or unknown -> 'exclude', 'no PM2.5'
+    2. datetime_last missing -> 'review', 'last date unknown'
+    5. Same name as another station but > 5 km apart ->
+       'review', 'same name far apart, check coordinates' (overrides rules 3 and 4)
+    3. In a duplicate group:
+       - latest datetime_last -> 'use' (if active) or 'history_only' (if inactive)
+       - other members -> 'history_only', 'older duplicate of <station_id>'
+    4. datetime_last older than 30 days -> 'history_only', 'no data in 30 days'
+    6. Everything else -> 'use', 'active monitor'
+    """
+    # Find stations sharing normalised name with another station > 5 km apart
+    by_name: dict[str, list[tuple[dict[str, Any], float, float]]] = defaultdict(list)
+    for s in stations:
+        norm = normalise_station_name(s.get("name"))
+        try:
+            lat = float(str(s.get("lat")).strip())
+            lon = float(str(s.get("lon")).strip())
+            by_name[norm].append((s, lat, lon))
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+    same_name_over_5km_ids: set[str] = set()
+    for _, stn_list in by_name.items():
+        if len(stn_list) < 2:
+            continue
+        for i in range(len(stn_list)):
+            for j in range(i + 1, len(stn_list)):
+                d_m = (
+                    haversine_distance_km(
+                        stn_list[i][1],
+                        stn_list[i][2],
+                        stn_list[j][1],
+                        stn_list[j][2],
+                    )
+                    * 1000.0
+                )
+                if d_m > 5000.0:
+                    same_name_over_5km_ids.add(
+                        clean_field(stn_list[i][0].get("station_id"))
+                    )
+                    same_name_over_5km_ids.add(
+                        clean_field(stn_list[j][0].get("station_id"))
+                    )
+
+    # Pre-calculate duplicate group latest member and activity
+    dup_group_info: dict[str, dict[str, Any]] = {}
+    for g in dup_groups:
+        members = g["stations"]
+
+        def _get_dt(stn: dict[str, Any]) -> date:
+            d = parse_iso_date(stn.get("datetime_last"))
+            return d if d is not None else date.min
+
+        # Sort descending by date, then deterministically by station_id
+        sorted_members = sorted(
+            members,
+            key=lambda stn: (_get_dt(stn), clean_field(stn.get("station_id"))),
+            reverse=True,
+        )
+        primary_stn = sorted_members[0]
+        primary_dt = _get_dt(primary_stn)
+        is_active = primary_dt >= cutoff_date
+        dup_group_info[g["group_id"]] = {
+            "primary_id": clean_field(primary_stn.get("station_id")),
+            "is_active": is_active,
+        }
+
+    decisions_map: dict[str, dict[str, str]] = {}
+
+    for s in stations:
+        sid = clean_field(s.get("station_id"))
+        pm25_val = str(s.get("has_pm25", "")).strip().lower()
+        has_pm25 = pm25_val in ("true", "t", "yes", "1")
+        has_pm25_no = pm25_val in ("false", "f", "no", "0")
+        has_pm25_unknown = not has_pm25 and not has_pm25_no
+
+        dt_last_str = str(s.get("datetime_last", "")).strip()
+        dt_last = parse_iso_date(dt_last_str)
+
+        gid = dup_map.get(sid, {}).get("group_id", "")
+
+        # Rule 1: has_pm25 is 'no' or unknown
+        if has_pm25_no or has_pm25_unknown:
+            prop_dec = "exclude"
+            prop_reason = "no PM2.5"
+        # Rule 2: datetime_last missing
+        elif not dt_last_str or dt_last is None:
+            prop_dec = "review"
+            prop_reason = "last date unknown"
+        # Rule 5 (override): Same name as another station but > 5 km apart
+        elif sid in same_name_over_5km_ids:
+            prop_dec = "review"
+            prop_reason = "same name far apart, check coordinates"
+        # Rule 3: In a duplicate group
+        elif gid and gid in dup_group_info:
+            g_info = dup_group_info[gid]
+            prim_id = g_info["primary_id"]
+            if not g_info["is_active"]:
+                # All members inactive
+                prop_dec = "history_only"
+                if sid == prim_id:
+                    prop_reason = "no data in 30 days"
+                else:
+                    prop_reason = f"older duplicate of {prim_id}"
+            else:
+                if sid == prim_id:
+                    prop_dec = "use"
+                    prop_reason = "active monitor"
+                else:
+                    prop_dec = "history_only"
+                    prop_reason = f"older duplicate of {prim_id}"
+        # Rule 4: datetime_last older than 30 days
+        elif dt_last < cutoff_date:
+            prop_dec = "history_only"
+            prop_reason = "no data in 30 days"
+        # Rule 6: Everything else
+        else:
+            prop_dec = "use"
+            prop_reason = "active monitor"
+
+        # publish_candidate: yes only if redistributionAllowed is True,
+        # licence is non-blank, and proposed_decision is 'use'
+        redist_val = str(s.get("redistributionAllowed", "")).strip().lower()
+        redist_allowed = redist_val in ("true", "t", "yes", "1")
+        lic_name = str(s.get("licence_name", "")).strip()
+        has_lic = bool(lic_name and lic_name.lower() != "unknown")
+
+        if redist_allowed and has_lic and prop_dec == "use":
+            pub_cand = "yes"
+        else:
+            pub_cand = "no"
+
+        decisions_map[sid] = {
+            "proposed_decision": prop_dec,
+            "proposed_reason": prop_reason,
+            "publish_candidate": pub_cand,
+        }
+
+    return decisions_map
+
+
+def generate_proposed_decisions_markdown(
+    candidates_rows: list[dict[str, Any]],
+    areas: list[dict[str, Any]],
+    licences_csv_path: str,
+    ref_date: date,
+    cutoff_date: date,
+) -> str:
+    """Generate Markdown text for proposed decisions report."""
+    total_candidates = len(candidates_rows)
+    dec_counts = Counter(r["proposed_decision"] for r in candidates_rows)
+    pub_counts = Counter(r["publish_candidate"] for r in candidates_rows)
+
+    # Area decision breakdown
+    area_dec_map: dict[str, Counter[str]] = defaultdict(Counter)
+    for r in candidates_rows:
+        area_dec_map[r["area_id"]][r["proposed_decision"]] += 1
+
+    md_lines: list[str] = [
+        "# Proposed Station Decisions Report (Task A-003c)",
+        "",
+        "## Overview & Decision Rules",
+        f"- **Input Licences File**: `{licences_csv_path}`",
+        f"- **Reference UTC Date**: `{ref_date.isoformat()}`",
+        f"- **Active Cutoff Date (30 days)**: `{cutoff_date.isoformat()}`",
+        f"- **Total Candidate Locations**: `{total_candidates}`",
+        "",
+        "### Decision Rules Hierarchy",
+        "The following rules were applied in strict sequential order:",
+        "",
+        (
+            "| Rule # | Condition | Proposed Decision | "
+            "Proposed Reason | Priority / Notes |"
+        ),
+        "|---|---|---|---|---|",
+        (
+            "| **1** | `has_pm25` is `no` or unknown | "
+            "`exclude` | `no PM2.5` | Highest priority |"
+        ),
+        (
+            "| **2** | `datetime_last` missing / invalid | "
+            "`review` | `last date unknown` | Evaluated second |"
+        ),
+        (
+            "| **5** | Same name as another station > 5 km apart | "
+            "`review` | `same name far apart, check coordinates` | "
+            "**Overrides rules 3 & 4** |"
+        ),
+        (
+            "| **3** | In duplicate group: latest member | "
+            "`use` (active) / `history_only` (inactive) | "
+            "`active monitor` / `no data in 30 days` | "
+            "Other members: `older duplicate of <id>` |"
+        ),
+        (
+            "| **4** | `datetime_last` older than 30 days | "
+            "`history_only` | `no data in 30 days` | "
+            "Inactive historical stations |"
+        ),
+        (
+            "| **6** | Everything else | `use` | `active monitor` | "
+            "Default for active valid monitors |"
+        ),
+        "",
+        "> [!IMPORTANT]",
+        "> **Publishing Policy Note (`AQ_11`)**:",
+        "> `proposed_decision` is **never** set to `publish`.",
+        (
+            "> A separate column `publish_candidate = yes` is set **only if** "
+            "`redistributionAllowed` is `True`,"
+        ),
+        "> `licence_name` is non-blank, and `proposed_decision` is `use`.",
+        (
+            "> **This does NOT mean publishing is allowed until the maintainer "
+            "has read and verified the licence text.**"
+        ),
+        "",
+        "## 1. Summary of Proposed Decisions",
+        "| Proposed Decision | Station Count | Share | Description |",
+        "|---|---|---|---|",
+        (
+            f"| `use` | {dec_counts.get('use', 0)} | "
+            f"{_fmt_pct(dec_counts.get('use', 0), total_candidates)} | "
+            "Active monitors recommended for forecast training/evaluation |"
+        ),
+        (
+            f"| `history_only` | {dec_counts.get('history_only', 0)} | "
+            f"{_fmt_pct(dec_counts.get('history_only', 0), total_candidates)} | "
+            "Inactive (> 30 days) or older duplicates of active stations |"
+        ),
+        (
+            f"| `review` | {dec_counts.get('review', 0)} | "
+            f"{_fmt_pct(dec_counts.get('review', 0), total_candidates)} | "
+            "Stations with same name > 5 km apart or missing dates |"
+        ),
+        (
+            f"| `exclude` | {dec_counts.get('exclude', 0)} | "
+            f"{_fmt_pct(dec_counts.get('exclude', 0), total_candidates)} | "
+            "Stations without confirmed PM2.5 capability |"
+        ),
+        (
+            f"| **Total** | **{total_candidates}** | **100.0%** | "
+            "All candidate stations within radius |"
+        ),
+        "",
+        (
+            f"- **Publish Candidates (`publish_candidate = yes`)**: "
+            f"**{pub_counts.get('yes', 0)}** "
+            f"({_fmt_pct(pub_counts.get('yes', 0), total_candidates)})"
+        ),
+        (
+            f"- **Internal / Non-Publish (`publish_candidate = no`)**: "
+            f"**{pub_counts.get('no', 0)}** "
+            f"({_fmt_pct(pub_counts.get('no', 0), total_candidates)})"
+        ),
+        "",
+        "## 2. Proposed Decisions by Forecast Area",
+        (
+            "| Area ID | Area Name | `use` | `history_only` | "
+            "`review` | `exclude` | Total |"
+        ),
+        "|---|---|---|---|---|---|---|",
+    ]
+
+    for a in areas:
+        aid = str(a["area_id"])
+        aname = str(a.get("name", aid))
+        counts = area_dec_map[aid]
+        sub_total = sum(counts.values())
+        md_lines.append(
+            f"| `{aid}` | {aname} | {counts.get('use', 0)} | "
+            f"{counts.get('history_only', 0)} | {counts.get('review', 0)} | "
+            f"{counts.get('exclude', 0)} | **{sub_total}** |"
+        )
+
+    # Stations requiring review
+    review_stations = [r for r in candidates_rows if r["proposed_decision"] == "review"]
+    md_lines.extend(
+        [
+            "",
+            "## 3. Stations Requiring Manual Review (`review`)",
+            f"Total stations flagged for review: **{len(review_stations)}**",
+            "",
+            "| Station ID | Name | Area ID | Distance (km) | Reason | datetime_last |",
+            "|---|---|---|---|---|---|",
+        ]
+    )
+
+    for r in review_stations:
+        sid = r["station_id"]
+        name = r["name"]
+        aid = r["area_id"]
+        dist = r["distance_km"]
+        reason = r["proposed_reason"]
+        dt_last = r["datetime_last"]
+        md_lines.append(
+            f"| {sid} | {name} | `{aid}` | {dist} | `{reason}` | `{dt_last}` |"
+        )
+
+    # Publish candidates table
+    pub_stations = [r for r in candidates_rows if r["publish_candidate"] == "yes"]
+    md_lines.extend(
+        [
+            "",
+            "## 4. Preliminary Publish Candidates (`publish_candidate = yes`)",
+            f"Total publish candidate stations: **{len(pub_stations)}**",
+            "",
+            "> [!NOTE]",
+            (
+                "> All other stations (108) have `redistributionAllowed = unknown` "
+                "or blank licences,"
+            ),
+            "> and must remain internal unless explicit permission is verified.",
+            "",
+            "| Station ID | Name | Provider | Licence Name | redistributionAllowed |",
+            "|---|---|---|---|---|",
+        ]
+    )
+
+    for r in pub_stations:
+        sid = r["station_id"]
+        name = r["name"]
+        prov = r["provider"]
+        lic = r["licence_name"]
+        redist = r["redistributionAllowed"]
+        md_lines.append(f"| {sid} | {name} | `{prov}` | `{lic}` | `{redist}` |")
+
+    md_lines.extend(
+        [
+            "",
+            "## 5. Next Steps for Maintainer",
+            "1. Open `data/stations_candidates.csv`.",
+            (
+                "2. Inspect the `review` stations in Section 3 and confirm "
+                "GPS coordinates."
+            ),
+            (
+                "3. Copy or adjust `proposed_decision` values into the official "
+                "`decision` column (`use` or `exclude`)."
+            ),
+            "4. Leave `decision` empty for any station still under verification.",
+            "",
+        ]
+    )
+
+    return "\n".join(md_lines)
+
+
 def analyse_stations(
     licences_csv_path: str,
     areas_json_path: str,
@@ -338,11 +822,13 @@ def analyse_stations(
     dup_m: float = 500.0,
     summary_md_path: str | None = None,
     duplicates_md_path: str | None = None,
+    duplicates_1000_md_path: str | None = None,
+    proposed_decisions_md_path: str | None = None,
     candidates_csv_path: str | None = None,
     as_of_date: date | None = None,
     include_outside: bool = False,
 ) -> dict[str, Any]:
-    """Analyse station licences CSV, detect duplicates, write reports and CSV."""
+    """Analyse station licences CSV, detect duplicates, propose decisions."""
     if as_of_date is None:
         ref_date = datetime.now(UTC).date()
     else:
@@ -358,8 +844,17 @@ def analyse_stations(
         reader = csv.DictReader(f)
         raw_rows = list(reader)
 
-    # 1. Run duplicate detection across all stations
+    # 1. Run duplicate detection at dup_m (default 500m)
     dup_map, dup_groups, far_apart_cases = detect_duplicates(raw_rows, dup_m=dup_m)
+
+    # 2. Run duplicate detection at 1000m for secondary report
+    _, dup_groups_1000, far_apart_1000 = detect_duplicates(raw_rows, dup_m=1000.0)
+
+    # 3. Propose decisions
+    cutoff_date = ref_date - timedelta(days=30)
+    decisions_map = propose_decisions(
+        raw_rows, dup_map, dup_groups, ref_date, cutoff_date
+    )
 
     # Tracking metrics
     area_counts: Counter[str] = Counter()
@@ -379,8 +874,6 @@ def analyse_stations(
     processed_rows: list[dict[str, Any]] = []
     candidates_rows: list[dict[str, Any]] = []
     outside_rows: list[dict[str, Any]] = []
-
-    cutoff_date = ref_date - timedelta(days=30)
 
     for row in raw_rows:
         lat_val = row.get("lat")
@@ -418,6 +911,14 @@ def analyse_stations(
 
         sid = clean_field(row.get("station_id"))
         dup_info = dup_map.get(sid, {"group_id": "", "dup_note": ""})
+        dec_info = decisions_map.get(
+            sid,
+            {
+                "proposed_decision": "review",
+                "proposed_reason": "unprocessed",
+                "publish_candidate": "no",
+            },
+        )
 
         row_item = {
             "station_id": sid,
@@ -429,6 +930,9 @@ def analyse_stations(
             "distance_km": f"{dist_km:.2f}" if dist_km is not None else "unknown",
             "duplicate_group_id": dup_info["group_id"],
             "dup_note": dup_info["dup_note"],
+            "proposed_decision": dec_info["proposed_decision"],
+            "proposed_reason": dec_info["proposed_reason"],
+            "publish_candidate": dec_info["publish_candidate"],
             "licence_name": clean_field(lic_name_raw),
             "commercialUseAllowed": clean_field(row.get("commercialUseAllowed")),
             "attributionRequired": clean_field(row.get("attributionRequired")),
@@ -448,12 +952,11 @@ def analyse_stations(
         if area_id == "outside":
             outside_rows.append(row_item)
 
-        # Candidate selection: stations within max_km (or all if include_outside)
         is_candidate = area_id not in ("outside", "unknown")
         if is_candidate or include_outside:
             candidates_rows.append(row_item)
 
-    # Write candidates CSV if requested
+    # Write candidates CSV
     if candidates_csv_path:
         csv_dir = os.path.dirname(os.path.abspath(candidates_csv_path))
         os.makedirs(csv_dir, exist_ok=True)
@@ -468,126 +971,41 @@ def analyse_stations(
     total_stations = len(raw_rows)
     kept_count = len(candidates_rows)
 
-    # Generate Reports: reports/station_duplicates.md
+    # Write reports/station_duplicates.md (500m)
     if duplicates_md_path:
         dup_md_dir = os.path.dirname(os.path.abspath(duplicates_md_path))
         os.makedirs(dup_md_dir, exist_ok=True)
-
-        dup_lines: list[str] = [
-            "# Station Duplicate Detection Report (Task A-003b)",
-            "",
-            "## Overview",
-            f"- **Input Licences File**: `{licences_csv_path}`",
-            f"- **Distance Threshold (`--dup-m`)**: `{dup_m} m` (maintainer guess)",
-            f"- **Total Locations Evaluated**: `{total_stations}`",
-            f"- **Likely Duplicate Groups Found**: `{len(dup_groups)}`",
-            f"- **Total Duplicate Stations**: "
-            f"`{sum(len(g['stations']) for g in dup_groups)}`",
-            f"- **Same-Name Stations Separated Beyond Threshold**: "
-            f"`{len(far_apart_cases)}`",
-            "",
-            "## 1. Likely Duplicate Groups (Distance <= "
-            f"{dup_m:.0f} m, Same Normalised Name)",
-            "",
-        ]
-
-        if not dup_groups:
-            dup_lines.append("No duplicate groups found within the threshold.\n")
-        else:
-            for g in dup_groups:
-                gid = g["group_id"]
-                gname = g["name"]
-                stns = g["stations"]
-                max_d = g["max_dist_m"]
-                dup_lines.extend(
-                    [
-                        f"### Group `{gid}`: {gname}",
-                        f"- **Stations in Group**: `{len(stns)}`",
-                        f"- **Maximum Distance Apart**: `{max_d:.1f} m`",
-                        "",
-                        "| Station ID | Provider | Distance Apart | datetime_first | "
-                        "datetime_last | Licence Name | has_pm25 |",
-                        "|---|---|---|---|---|---|---|",
-                    ]
-                )
-                for s in stns:
-                    sid = clean_field(s.get("station_id"))
-                    prov = clean_field(s.get("provider"))
-                    dt_first = clean_field(s.get("datetime_first"))
-                    dt_last = clean_field(s.get("datetime_last"))
-                    lic = clean_field(s.get("licence_name"))
-                    pm25 = clean_field(s.get("has_pm25"))
-
-                    # Distances to other members in group
-                    dist_notes = []
-                    for pw in g["pairwise"]:
-                        if pw["s1_id"] == sid:
-                            dist_notes.append(
-                                f"{pw['dist_m']:.1f} m (to {pw['s2_id']})"
-                            )
-                        elif pw["s2_id"] == sid:
-                            dist_notes.append(
-                                f"{pw['dist_m']:.1f} m (to {pw['s1_id']})"
-                            )
-                    dist_disp = "; ".join(dist_notes) if dist_notes else "0.0 m"
-
-                    dup_lines.append(
-                        f"| {sid} | `{prov}` | {dist_disp} | `{dt_first}` | "
-                        f"`{dt_last}` | `{lic}` | `{pm25}` |"
-                    )
-                dup_lines.append("")
-
-        dup_lines.extend(
-            [
-                f"## 2. Same Name, Far Apart (> {dup_m:.0f} m)",
-                "",
-                "These stations share identical normalised names but are located "
-                f"farther apart than `{dup_m} m`. "
-                "Per project rules, they are **not** treated as duplicates.",
-                "",
-                "| Station ID | Normalised Name | Provider | Closest Counterpart | "
-                "Distance Apart | datetime_last |",
-                "|---|---|---|---|---|---|",
-            ]
+        dup_md_text = generate_duplicates_markdown(
+            dup_groups, far_apart_cases, licences_csv_path, dup_m, total_stations
         )
-
-        if not far_apart_cases:
-            dup_lines.append("No same-name far-apart stations found.\n")
-        else:
-            for fa in far_apart_cases:
-                s = fa["station"]
-                sid = clean_field(s.get("station_id"))
-                prov = clean_field(s.get("provider"))
-                name_disp = fa["norm_name"]
-                c_stn = fa["closest_other"]
-                c_id = clean_field(c_stn.get("station_id"))
-                d_m = fa["distance_m"]
-                d_disp = f"{d_m / 1000.0:.2f} km" if d_m >= 1000.0 else f"{d_m:.1f} m"
-                dt_l = clean_field(s.get("datetime_last"))
-                dup_lines.append(
-                    f"| {sid} | `{name_disp}` | `{prov}` | Station {c_id} | "
-                    f"**{d_disp}** | `{dt_l}` |"
-                )
-
-        dup_lines.extend(
-            [
-                "",
-                "## 3. Decision Guidance for Candidates CSV",
-                "1. In candidates CSV, duplicates are tagged with `duplicate_group_id` "
-                "and `dup_note`.",
-                "2. When deciding which station to keep in each duplicate group:",
-                "   - Prefer stations with active reporting (`datetime_last` in 2026).",
-                "   - Prefer reference-grade monitors (`is_monitor = True`).",
-                "   - Mark one as `use` and duplicates as `exclude` in `decision`.",
-                "3. The `decision` column remains empty for maintainer review.",
-                "",
-            ]
-        )
-
         with open(duplicates_md_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(dup_lines))
+            f.write(dup_md_text)
 
-    # Generate Markdown Summary Report (reports/station_summary.md)
+    # Write reports/station_duplicates_1000m.md (1000m)
+    if duplicates_1000_md_path:
+        dup_1000_dir = os.path.dirname(os.path.abspath(duplicates_1000_md_path))
+        os.makedirs(dup_1000_dir, exist_ok=True)
+        dup_1000_text = generate_duplicates_markdown(
+            dup_groups_1000,
+            far_apart_1000,
+            licences_csv_path,
+            1000.0,
+            total_stations,
+        )
+        with open(duplicates_1000_md_path, "w", encoding="utf-8") as f:
+            f.write(dup_1000_text)
+
+    # Write reports/proposed_decisions.md
+    if proposed_decisions_md_path:
+        prop_dir = os.path.dirname(os.path.abspath(proposed_decisions_md_path))
+        os.makedirs(prop_dir, exist_ok=True)
+        prop_md_text = generate_proposed_decisions_markdown(
+            candidates_rows, areas, licences_csv_path, ref_date, cutoff_date
+        )
+        with open(proposed_decisions_md_path, "w", encoding="utf-8") as f:
+            f.write(prop_md_text)
+
+    # Write reports/station_summary.md
     if summary_md_path:
         md_dir = os.path.dirname(os.path.abspath(summary_md_path))
         os.makedirs(md_dir, exist_ok=True)
@@ -604,7 +1022,8 @@ def analyse_stations(
             f"- **Total Locations Evaluated**: `{total_stations}`",
             f"- **Candidate Locations Kept**: `{kept_count}`",
             f"- **Locations Outside Threshold**: `{len(outside_rows)}`",
-            f"- **Duplicate Groups Detected**: `{len(dup_groups)}`",
+            f"- **Duplicate Groups Detected (500m)**: `{len(dup_groups)}`",
+            f"- **Duplicate Groups Detected (1000m)**: `{len(dup_groups_1000)}`",
             "",
             "## 1. Station Distribution by Forecast Area",
             "| Area ID | Description / Center | Radius Limit | Station Count | Share |",
@@ -700,10 +1119,10 @@ def analyse_stations(
                 f"**{recency_counts['unknown_or_missing']}**",
                 "",
                 "## 6. Duplicate Station Summary",
-                f"- **Duplicate Distance Threshold (`--dup-m`)**: `{dup_m} m`",
-                f"- **Likely Duplicate Groups**: `{len(dup_groups)}`",
-                f"- **Same-Name Far Apart**: `{len(far_apart_cases)}`",
-                "- Detailed audit available in `reports/station_duplicates.md`.",
+                f"- **Threshold 500m**: `{len(dup_groups)}` duplicate groups "
+                "(see `reports/station_duplicates.md`).",
+                f"- **Threshold 1000m**: `{len(dup_groups_1000)}` duplicate groups "
+                "(see `reports/station_duplicates_1000m.md`).",
                 "",
                 "## 7. Outside Locations (> 25 km threshold)",
                 f"Total outside locations: **{len(outside_rows)}**",
@@ -732,11 +1151,15 @@ def analyse_stations(
         md_lines.extend(
             [
                 "",
-                "## 8. Next Steps & Decision Guide",
-                "1. Inspect `data/stations_candidates.csv`.",
-                "2. Check duplicate tags (`duplicate_group_id`, `dup_note`).",
-                "3. Fill `decision` column (`use`, `publish`, `exclude`) per `AQ_11`.",
-                "4. Do not invent licences; unverified flags stay `unknown`.",
+                "## 8. Proposed Decisions Summary",
+                (
+                    "- Detailed rule rationale and table in "
+                    "`reports/proposed_decisions.md`."
+                ),
+                (
+                    "- Review `data/stations_candidates.csv` before filling official "
+                    "`decision`."
+                ),
                 "",
             ]
         )
@@ -744,13 +1167,15 @@ def analyse_stations(
         with open(summary_md_path, "w", encoding="utf-8") as f:
             f.write("\n".join(md_lines))
 
+    cand_dec_counts = Counter(r["proposed_decision"] for r in candidates_rows)
+
     return {
         "total_stations": total_stations,
         "kept_candidates": kept_count,
         "outside_count": len(outside_rows),
-        "duplicate_groups_count": len(dup_groups),
-        "duplicate_stations_count": sum(len(g["stations"]) for g in dup_groups),
-        "far_apart_count": len(far_apart_cases),
+        "duplicate_groups_500m": len(dup_groups),
+        "duplicate_groups_1000m": len(dup_groups_1000),
+        "proposed_decisions": dict(cand_dec_counts),
         "ref_date": ref_date.isoformat(),
         "area_counts": dict(area_counts),
         "provider_counts": dict(provider_counts),
@@ -794,7 +1219,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--duplicates-md",
         default="reports/station_duplicates.md",
-        help="Path to duplicates report (default: reports/station_duplicates.md).",
+        help="Path to 500m duplicates report (default: reports/station_duplicates.md).",
+    )
+    parser.add_argument(
+        "--duplicates-1000-md",
+        default="reports/station_duplicates_1000m.md",
+        help=(
+            "Path to 1000m duplicates report "
+            "(default: reports/station_duplicates_1000m.md)."
+        ),
+    )
+    parser.add_argument(
+        "--proposed-decisions-md",
+        default="reports/proposed_decisions.md",
+        help=(
+            "Path to proposed decisions report "
+            "(default: reports/proposed_decisions.md)."
+        ),
     )
     parser.add_argument(
         "--candidates-csv",
@@ -839,6 +1280,8 @@ def main(argv: list[str] | None = None) -> int:
             dup_m=args.dup_m,
             summary_md_path=args.summary_md,
             duplicates_md_path=args.duplicates_md,
+            duplicates_1000_md_path=args.duplicates_1000_md,
+            proposed_decisions_md_path=args.proposed_decisions_md,
             candidates_csv_path=args.candidates_csv,
             as_of_date=as_of,
             include_outside=args.include_outside,
@@ -850,15 +1293,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error during analysis: {e}", file=sys.stderr)
         return 1
 
-    print("Station analysis complete:")
+    print("Station analysis and proposed decisions complete:")
     print(f"  Total locations: {results['total_stations']}")
     print(f"  Kept candidates: {results['kept_candidates']}")
     print(f"  Outside locations: {results['outside_count']}")
-    print(f"  Duplicate groups: {results['duplicate_groups_count']}")
-    print(f"  Duplicate stations: {results['duplicate_stations_count']}")
-    print(f"  Same-name far apart: {results['far_apart_count']}")
+    print(f"  Duplicate groups (500m): {results['duplicate_groups_500m']}")
+    print(f"  Duplicate groups (1000m): {results['duplicate_groups_1000m']}")
+    print(f"  Proposed decisions: {results['proposed_decisions']}")
     print(f"  Summary report: {args.summary_md}")
-    print(f"  Duplicates report: {args.duplicates_md}")
+    print(f"  Duplicates report (500m): {args.duplicates_md}")
+    print(f"  Duplicates report (1000m): {args.duplicates_1000_md}")
+    print(f"  Proposed decisions report: {args.proposed_decisions_md}")
     print(f"  Candidates CSV: {args.candidates_csv}")
     return 0
 
