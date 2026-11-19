@@ -512,9 +512,15 @@ def propose_decisions(
                     )
 
     # Pre-calculate duplicate group latest member and activity
+    # Rule 3 info: find primary member for each group and check same provider
     dup_group_info: dict[str, dict[str, Any]] = {}
     for g in dup_groups:
         members = g["stations"]
+        if not members:
+            continue
+
+        providers = {clean_field(stn.get("provider")).lower() for stn in members}
+        same_provider = len(providers) == 1
 
         def _get_dt(stn: dict[str, Any]) -> date:
             d = parse_iso_date(stn.get("datetime_last"))
@@ -532,6 +538,7 @@ def propose_decisions(
         dup_group_info[g["group_id"]] = {
             "primary_id": clean_field(primary_stn.get("station_id")),
             "is_active": is_active,
+            "same_provider": same_provider,
         }
 
     decisions_map: dict[str, dict[str, str]] = {}
@@ -552,10 +559,6 @@ def propose_decisions(
         if has_pm25_no or has_pm25_unknown:
             prop_dec = "exclude"
             prop_reason = "no PM2.5"
-        # Rule 2: datetime_last missing
-        elif not dt_last_str or dt_last is None:
-            prop_dec = "review"
-            prop_reason = "last date unknown"
         # Rule 5 (override): Same name as another station but > 5 km apart
         elif sid in same_name_over_5km_ids:
             prop_dec = "review"
@@ -563,21 +566,33 @@ def propose_decisions(
         # Rule 3: In a duplicate group
         elif gid and gid in dup_group_info:
             g_info = dup_group_info[gid]
-            prim_id = g_info["primary_id"]
-            if not g_info["is_active"]:
-                # All members inactive
-                prop_dec = "history_only"
-                if sid == prim_id:
-                    prop_reason = "no data in 30 days"
-                else:
-                    prop_reason = f"older duplicate of {prim_id}"
+            if g_info["same_provider"]:
+                # Rule 3 exception: same-provider cluster
+                prop_dec = "review"
+                prop_reason = "same-provider cluster, check if separate devices"
+            elif not dt_last_str or dt_last is None:
+                prop_dec = "review"
+                prop_reason = "last date unknown"
             else:
-                if sid == prim_id:
-                    prop_dec = "use"
-                    prop_reason = "active monitor"
-                else:
+                prim_id = g_info["primary_id"]
+                if not g_info["is_active"]:
+                    # All members inactive
                     prop_dec = "history_only"
-                    prop_reason = f"older duplicate of {prim_id}"
+                    if sid == prim_id:
+                        prop_reason = "no data in 30 days"
+                    else:
+                        prop_reason = f"older duplicate of {prim_id}"
+                else:
+                    if sid == prim_id:
+                        prop_dec = "use"
+                        prop_reason = "active monitor"
+                    else:
+                        prop_dec = "history_only"
+                        prop_reason = f"older duplicate of {prim_id}"
+        # Rule 2: datetime_last missing (stations not in duplicate groups)
+        elif not dt_last_str or dt_last is None:
+            prop_dec = "review"
+            prop_reason = "last date unknown"
         # Rule 4: datetime_last older than 30 days
         elif dt_last < cutoff_date:
             prop_dec = "history_only"
@@ -614,6 +629,7 @@ def generate_proposed_decisions_markdown(
     licences_csv_path: str,
     ref_date: date,
     cutoff_date: date,
+    proposal_dup_m: float = 500.0,
 ) -> str:
     """Generate Markdown text for proposed decisions report."""
     total_candidates = len(candidates_rows)
@@ -630,11 +646,19 @@ def generate_proposed_decisions_markdown(
         "",
         "## Overview & Decision Rules",
         f"- **Input Licences File**: `{licences_csv_path}`",
+        (
+            f"- **Duplicate Threshold for Proposals (`--proposal-dup-m`)**: "
+            f"`{proposal_dup_m:.0f} m` (maintainer guess)"
+        ),
         f"- **Reference UTC Date**: `{ref_date.isoformat()}`",
         f"- **Active Cutoff Date (30 days)**: `{cutoff_date.isoformat()}`",
         f"- **Total Candidate Locations**: `{total_candidates}`",
         "",
         "### Decision Rules Hierarchy",
+        (
+            f"Duplicate detection threshold feeding these proposals is "
+            f"`{proposal_dup_m:.0f} m`."
+        ),
         "The following rules were applied in strict sequential order:",
         "",
         (
@@ -647,19 +671,24 @@ def generate_proposed_decisions_markdown(
             "`exclude` | `no PM2.5` | Highest priority |"
         ),
         (
-            "| **2** | `datetime_last` missing / invalid | "
-            "`review` | `last date unknown` | Evaluated second |"
-        ),
-        (
             "| **5** | Same name as another station > 5 km apart | "
             "`review` | `same name far apart, check coordinates` | "
             "**Overrides rules 3 & 4** |"
         ),
         (
-            "| **3** | In duplicate group: latest member | "
+            "| **3** | In duplicate group (same provider) | "
+            "`review` | `same-provider cluster, check if separate devices` | "
+            "Rule 3 exception: never marked `history_only` |"
+        ),
+        (
+            "| **3** | In duplicate group (different providers) | "
             "`use` (active) / `history_only` (inactive) | "
             "`active monitor` / `no data in 30 days` | "
             "Other members: `older duplicate of <id>` |"
+        ),
+        (
+            "| **2** | `datetime_last` missing / invalid | "
+            "`review` | `last date unknown` | Evaluated before recency |"
         ),
         (
             "| **4** | `datetime_last` older than 30 days | "
@@ -700,7 +729,7 @@ def generate_proposed_decisions_markdown(
         (
             f"| `review` | {dec_counts.get('review', 0)} | "
             f"{_fmt_pct(dec_counts.get('review', 0), total_candidates)} | "
-            "Stations with same name > 5 km apart or missing dates |"
+            "Stations with same name > 5 km apart, missing dates, or clusters |"
         ),
         (
             f"| `exclude` | {dec_counts.get('exclude', 0)} | "
@@ -718,7 +747,7 @@ def generate_proposed_decisions_markdown(
             f"({_fmt_pct(pub_counts.get('yes', 0), total_candidates)})"
         ),
         (
-            f"- **Internal / Non-Publish (`publish_candidate = no`)**: "
+            f"- **Non-Publish Candidates (`publish_candidate = no`)**: "
             f"**{pub_counts.get('no', 0)}** "
             f"({_fmt_pct(pub_counts.get('no', 0), total_candidates)})"
         ),
@@ -776,10 +805,10 @@ def generate_proposed_decisions_markdown(
             "",
             "> [!NOTE]",
             (
-                "> All other stations (108) have `redistributionAllowed = unknown` "
-                "or blank licences,"
+                f"> All other stations ({pub_counts.get('no', 0)}) have "
+                "`redistributionAllowed = unknown` or blank licences;"
             ),
-            "> and must remain internal unless explicit permission is verified.",
+            "> internal use of unlicensed stations is unverified.",
             "",
             "| Station ID | Name | Provider | Licence Name | redistributionAllowed |",
             "|---|---|---|---|---|",
@@ -820,6 +849,7 @@ def analyse_stations(
     areas_json_path: str,
     max_km: float = 25.0,
     dup_m: float = 500.0,
+    proposal_dup_m: float = 500.0,
     summary_md_path: str | None = None,
     duplicates_md_path: str | None = None,
     duplicates_1000_md_path: str | None = None,
@@ -850,10 +880,29 @@ def analyse_stations(
     # 2. Run duplicate detection at 1000m for secondary report
     _, dup_groups_1000, far_apart_1000 = detect_duplicates(raw_rows, dup_m=1000.0)
 
-    # 3. Propose decisions
+    # 3. Duplicate detection feeding proposed decisions
+    if proposal_dup_m == dup_m:
+        prop_dup_map = dup_map
+        prop_dup_groups = dup_groups
+    elif proposal_dup_m == 1000.0:
+        prop_dup_map = {
+            s["station_id"]: {
+                "group_id": s["duplicate_group_id"],
+                "dup_note": s["dup_note"],
+            }
+            for g in dup_groups_1000
+            for s in g["stations"]
+        }
+        prop_dup_groups = dup_groups_1000
+    else:
+        prop_dup_map, prop_dup_groups, _ = detect_duplicates(
+            raw_rows, dup_m=proposal_dup_m
+        )
+
+    # 4. Propose decisions
     cutoff_date = ref_date - timedelta(days=30)
     decisions_map = propose_decisions(
-        raw_rows, dup_map, dup_groups, ref_date, cutoff_date
+        raw_rows, prop_dup_map, prop_dup_groups, ref_date, cutoff_date
     )
 
     # Tracking metrics
@@ -1000,7 +1049,12 @@ def analyse_stations(
         prop_dir = os.path.dirname(os.path.abspath(proposed_decisions_md_path))
         os.makedirs(prop_dir, exist_ok=True)
         prop_md_text = generate_proposed_decisions_markdown(
-            candidates_rows, areas, licences_csv_path, ref_date, cutoff_date
+            candidates_rows,
+            areas,
+            licences_csv_path,
+            ref_date,
+            cutoff_date,
+            proposal_dup_m=proposal_dup_m,
         )
         with open(proposed_decisions_md_path, "w", encoding="utf-8") as f:
             f.write(prop_md_text)
@@ -1175,6 +1229,7 @@ def analyse_stations(
         "outside_count": len(outside_rows),
         "duplicate_groups_500m": len(dup_groups),
         "duplicate_groups_1000m": len(dup_groups_1000),
+        "proposal_dup_m": proposal_dup_m,
         "proposed_decisions": dict(cand_dec_counts),
         "ref_date": ref_date.isoformat(),
         "area_counts": dict(area_counts),
@@ -1210,6 +1265,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=500.0,
         help="Metres to consider same-name stations duplicates (default: 500m).",
+    )
+    parser.add_argument(
+        "--proposal-dup-m",
+        type=float,
+        default=500.0,
+        help=(
+            "Duplicate distance threshold in metres used for proposed "
+            "decisions (default: 500.0m)."
+        ),
     )
     parser.add_argument(
         "--summary-md",
@@ -1278,6 +1342,7 @@ def main(argv: list[str] | None = None) -> int:
             areas_json_path=args.areas_json,
             max_km=args.max_km,
             dup_m=args.dup_m,
+            proposal_dup_m=args.proposal_dup_m,
             summary_md_path=args.summary_md,
             duplicates_md_path=args.duplicates_md,
             duplicates_1000_md_path=args.duplicates_1000_md,
@@ -1299,11 +1364,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Outside locations: {results['outside_count']}")
     print(f"  Duplicate groups (500m): {results['duplicate_groups_500m']}")
     print(f"  Duplicate groups (1000m): {results['duplicate_groups_1000m']}")
+    print(f"  Proposal duplicate threshold: {results['proposal_dup_m']:.0f} m")
     print(f"  Proposed decisions: {results['proposed_decisions']}")
     print(f"  Summary report: {args.summary_md}")
     print(f"  Duplicates report (500m): {args.duplicates_md}")
     print(f"  Duplicates report (1000m): {args.duplicates_1000_md}")
     print(f"  Proposed decisions report: {args.proposed_decisions_md}")
+    print(f"  Candidates CSV: {args.candidates_csv}")
+    return 0
     print(f"  Candidates CSV: {args.candidates_csv}")
     return 0
 

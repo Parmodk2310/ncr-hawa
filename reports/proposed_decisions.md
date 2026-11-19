@@ -2,19 +2,22 @@
 
 ## Overview & Decision Rules
 - **Input Licences File**: `data/licences.csv`
+- **Duplicate Threshold for Proposals (`--proposal-dup-m`)**: `500 m` (maintainer guess)
 - **Reference UTC Date**: `2026-11-19`
 - **Active Cutoff Date (30 days)**: `2026-10-20`
 - **Total Candidate Locations**: `119`
 
 ### Decision Rules Hierarchy
+Duplicate detection threshold feeding these proposals is `500 m`.
 The following rules were applied in strict sequential order:
 
 | Rule # | Condition | Proposed Decision | Proposed Reason | Priority / Notes |
 |---|---|---|---|---|
 | **1** | `has_pm25` is `no` or unknown | `exclude` | `no PM2.5` | Highest priority |
-| **2** | `datetime_last` missing / invalid | `review` | `last date unknown` | Evaluated second |
 | **5** | Same name as another station > 5 km apart | `review` | `same name far apart, check coordinates` | **Overrides rules 3 & 4** |
-| **3** | In duplicate group: latest member | `use` (active) / `history_only` (inactive) | `active monitor` / `no data in 30 days` | Other members: `older duplicate of <id>` |
+| **3** | In duplicate group (same provider) | `review` | `same-provider cluster, check if separate devices` | Rule 3 exception: never marked `history_only` |
+| **3** | In duplicate group (different providers) | `use` (active) / `history_only` (inactive) | `active monitor` / `no data in 30 days` | Other members: `older duplicate of <id>` |
+| **2** | `datetime_last` missing / invalid | `review` | `last date unknown` | Evaluated before recency |
 | **4** | `datetime_last` older than 30 days | `history_only` | `no data in 30 days` | Inactive historical stations |
 | **6** | Everything else | `use` | `active monitor` | Default for active valid monitors |
 
@@ -28,48 +31,51 @@ The following rules were applied in strict sequential order:
 ## 1. Summary of Proposed Decisions
 | Proposed Decision | Station Count | Share | Description |
 |---|---|---|---|
-| `use` | 77 | 64.7% | Active monitors recommended for forecast training/evaluation |
-| `history_only` | 28 | 23.5% | Inactive (> 30 days) or older duplicates of active stations |
-| `review` | 12 | 10.1% | Stations with same name > 5 km apart or missing dates |
+| `use` | 76 | 63.9% | Active monitors recommended for forecast training/evaluation |
+| `history_only` | 26 | 21.8% | Inactive (> 30 days) or older duplicates of active stations |
+| `review` | 15 | 12.6% | Stations with same name > 5 km apart, missing dates, or clusters |
 | `exclude` | 2 | 1.7% | Stations without confirmed PM2.5 capability |
 | **Total** | **119** | **100.0%** | All candidate stations within radius |
 
-- **Publish Candidates (`publish_candidate = yes`)**: **11** (9.2%)
-- **Internal / Non-Publish (`publish_candidate = no`)**: **108** (90.8%)
+- **Publish Candidates (`publish_candidate = yes`)**: **10** (8.4%)
+- **Non-Publish Candidates (`publish_candidate = no`)**: **109** (91.6%)
 
 ## 2. Proposed Decisions by Forecast Area
 | Area ID | Area Name | `use` | `history_only` | `review` | `exclude` | Total |
 |---|---|---|---|---|---|---|
 | `central_delhi` | Central Delhi | 40 | 20 | 6 | 2 | **68** |
-| `noida` | Noida | 10 | 0 | 2 | 0 | **12** |
+| `noida` | Noida | 9 | 0 | 3 | 0 | **12** |
 | `gurugram` | Gurugram | 11 | 0 | 4 | 0 | **15** |
-| `ghaziabad` | Ghaziabad | 11 | 5 | 0 | 0 | **16** |
+| `ghaziabad` | Ghaziabad | 11 | 3 | 2 | 0 | **16** |
 | `faridabad` | Faridabad | 5 | 3 | 0 | 0 | **8** |
 
 ## 3. Stations Requiring Manual Review (`review`)
-Total stations flagged for review: **12**
+Total stations flagged for review: **15**
 
 | Station ID | Name | Area ID | Distance (km) | Reason | datetime_last |
 |---|---|---|---|---|---|
 | 15 | IGI Airport | `central_delhi` | 12.62 | `last date unknown` | `unknown` |
 | 16 | Civil Lines | `central_delhi` | 7.80 | `last date unknown` | `unknown` |
+| 5509 | Anand Vihar, Delhi - DPCC | `ghaziabad` | 10.47 | `same-provider cluster, check if separate devices` | `2022-10-31T00:30:00Z` |
 | 5743 | Rohini, Delhi - DPCC | `central_delhi` | 20.78 | `same name far apart, check coordinates` | `2018-05-12T06:30:00Z` |
 | 5759 | Sonia Vihar, Delhi - DPCC | `central_delhi` | 11.49 | `same name far apart, check coordinates` | `2018-05-12T05:00:00Z` |
 | 5760 | Dwarka-Sector 8, Delhi - DPCC | `gurugram` | 23.25 | `same name far apart, check coordinates` | `2018-05-12T05:00:00Z` |
 | 6314 | NISE Gwal Pahari, Gurugram - IMD | `gurugram` | 18.11 | `same name far apart, check coordinates` | `2018-11-16T04:00:00Z` |
 | 6931 | Dwarka-Sector 8, Delhi - DPCC | `gurugram` | 13.01 | `same name far apart, check coordinates` | `2026-11-18T18:00:00Z` |
 | 8475 | Sonia Vihar, Delhi - DPCC | `central_delhi` | 11.82 | `same name far apart, check coordinates` | `2026-11-18T18:00:00Z` |
+| 10487 | Anand Vihar, Delhi - DPCC | `ghaziabad` | 10.47 | `same-provider cluster, check if separate devices` | `2021-09-20T07:45:00Z` |
 | 10831 | Rohini, Delhi - DPCC | `central_delhi` | 16.21 | `same name far apart, check coordinates` | `2026-11-18T18:00:00Z` |
 | 10921 | NISE Gwal Pahari, Gurugram - IMD | `gurugram` | 12.35 | `same name far apart, check coordinates` | `2026-11-18T18:00:00Z` |
-| 6551894 | A-Block Sector 51 NOIDA | `noida` | 5.08 | `last date unknown` | `unknown` |
-| 6552066 | A-Block Sector 51 NOIDA | `noida` | 5.03 | `last date unknown` | `unknown` |
+| 6551848 | A-Block Sector 51 NOIDA | `noida` | 4.95 | `same-provider cluster, check if separate devices` | `2026-11-18T01:00:00Z` |
+| 6551894 | A-Block Sector 51 NOIDA | `noida` | 5.08 | `same-provider cluster, check if separate devices` | `unknown` |
+| 6552066 | A-Block Sector 51 NOIDA | `noida` | 5.03 | `same-provider cluster, check if separate devices` | `unknown` |
 
 ## 4. Preliminary Publish Candidates (`publish_candidate = yes`)
-Total publish candidate stations: **11**
+Total publish candidate stations: **10**
 
 > [!NOTE]
-> All other stations (108) have `redistributionAllowed = unknown` or blank licences,
-> and must remain internal unless explicit permission is verified.
+> All other stations (109) have `redistributionAllowed = unknown` or blank licences;
+> internal use of unlicensed stations is unverified.
 
 | Station ID | Name | Provider | Licence Name | redistributionAllowed |
 |---|---|---|---|---|
@@ -83,7 +89,6 @@ Total publish candidate stations: **11**
 | 6145551 | Anand Lok | `AirGradient` | `CC BY 4.0` | `True` |
 | 6551511 | Sector-26, Noida | `AirGradient` | `CC BY 4.0` | `True` |
 | 6551581 | Anahad Foundation | `AirGradient` | `CC BY 4.0` | `True` |
-| 6551848 | A-Block Sector 51 NOIDA | `AirGradient` | `CC BY 4.0` | `True` |
 
 ## 5. Next Steps for Maintainer
 1. Open `data/stations_candidates.csv`.

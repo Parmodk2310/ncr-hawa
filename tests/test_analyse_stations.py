@@ -190,12 +190,13 @@ def test_rule_2_missing_datetime_last() -> None:
 
 
 def test_rule_3_duplicate_group_active_and_all_inactive() -> None:
-    """Rule 3: Duplicate group resolution for active vs all-inactive groups."""
-    # Active group (Stn 1 active, Stn 2 older)
+    """Rule 3: Duplicate group resolution for cross-provider groups."""
+    # Active group (Stn 1 active CPCB, Stn 2 older caaqm)
     stns_active = [
         {
             "station_id": "1",
             "name": "A",
+            "provider": "CPCB",
             "lat": "28.6",
             "lon": "77.2",
             "has_pm25": "True",
@@ -204,6 +205,7 @@ def test_rule_3_duplicate_group_active_and_all_inactive() -> None:
         {
             "station_id": "2",
             "name": "a",
+            "provider": "caaqm",
             "lat": "28.6",
             "lon": "77.2",
             "has_pm25": "True",
@@ -219,11 +221,12 @@ def test_rule_3_duplicate_group_active_and_all_inactive() -> None:
     assert decs["2"]["proposed_decision"] == "history_only"
     assert decs["2"]["proposed_reason"] == "older duplicate of 1"
 
-    # All inactive group (Stn 3 from 2024, Stn 4 from 2022)
+    # All inactive cross-provider group (Stn 3 from 2024, Stn 4 from 2022)
     stns_inactive = [
         {
             "station_id": "3",
             "name": "B",
+            "provider": "CPCB",
             "lat": "28.6",
             "lon": "77.2",
             "has_pm25": "True",
@@ -232,6 +235,7 @@ def test_rule_3_duplicate_group_active_and_all_inactive() -> None:
         {
             "station_id": "4",
             "name": "b",
+            "provider": "caaqm",
             "lat": "28.6",
             "lon": "77.2",
             "has_pm25": "True",
@@ -244,6 +248,46 @@ def test_rule_3_duplicate_group_active_and_all_inactive() -> None:
     assert decs2["3"]["proposed_reason"] == "no data in 30 days"
     assert decs2["4"]["proposed_decision"] == "history_only"
     assert decs2["4"]["proposed_reason"] == "older duplicate of 3"
+
+
+def test_rule_3_exception_same_provider_cluster() -> None:
+    """Rule 3 exception: same-provider duplicate cluster marks all review."""
+    stations = [
+        {
+            "station_id": "10",
+            "name": "Cluster",
+            "provider": "CPCB",
+            "lat": "28.6",
+            "lon": "77.2",
+            "has_pm25": "True",
+            "datetime_last": "2026-11-18",
+        },
+        {
+            "station_id": "11",
+            "name": "cluster",
+            "provider": "CPCB",
+            "lat": "28.6",
+            "lon": "77.2",
+            "has_pm25": "True",
+            "datetime_last": "2020-01-01",
+        },
+    ]
+    dup_map, dup_groups, _ = detect_duplicates(stations, dup_m=500.0)
+    ref_d = date(2026, 11, 19)
+    cutoff = date(2026, 10, 20)
+    decs = propose_decisions(stations, dup_map, dup_groups, ref_d, cutoff)
+
+    # Neither may be marked 'history_only' or 'use'
+    assert decs["10"]["proposed_decision"] == "review"
+    assert (
+        decs["10"]["proposed_reason"]
+        == "same-provider cluster, check if separate devices"
+    )
+    assert decs["11"]["proposed_decision"] == "review"
+    assert (
+        decs["11"]["proposed_reason"]
+        == "same-provider cluster, check if separate devices"
+    )
 
 
 def test_rule_4_datetime_last_older_than_30_days() -> None:
@@ -427,6 +471,8 @@ def test_end_to_end_tiny_csv_full_pipeline(tmp_path: Path) -> None:
             "30.0",
             "--dup-m",
             "500.0",
+            "--proposal-dup-m",
+            "500.0",
             "--summary-md",
             str(summary_md),
             "--duplicates-md",
@@ -483,6 +529,8 @@ def test_end_to_end_tiny_csv_full_pipeline(tmp_path: Path) -> None:
     assert "| **5** | Same name as another station > 5 km apart" in prop_content
     assert "Publishing Policy Note" in prop_content
     assert "Proposed Decisions by Forecast Area" in prop_content
+    assert "Duplicate Threshold for Proposals (`--proposal-dup-m`)" in prop_content
+    assert "internal use of unlicensed stations is unverified" in prop_content
 
     # 3. Verify that Patparganj (7 & 8) is far apart at 500m, but duplicate at 1000m
     d500_text = dup_500_md.read_text(encoding="utf-8")
