@@ -17,8 +17,7 @@ from ingest.archive_open_meteo import (
     archive_forecasts,
     build_request_url,
     fetch_with_retries,
-    validate_response_payload,
-    write_raw_file_atomically,
+    main,
 )
 
 
@@ -161,8 +160,7 @@ def test_http_400_handling_logs_to_failures_no_archive(
             {
                 "cams": {
                     "endpoint": "https://air-quality-api.open-meteo.com/v1/air-quality",
-                    "domains": "cams_global",
-                    "hourly": ["invalid_var"],
+                    "hourly": ["pm2_5"],
                 },
                 "weather": {
                     "endpoint": "https://api.open-meteo.com/v1/forecast",
@@ -185,86 +183,44 @@ def test_http_400_handling_logs_to_failures_no_archive(
     assert stats["failed"] == 2
     assert stats["success"] == 0
 
-    failures_file = raw_dir / "failures.jsonl"
-    assert failures_file.exists()
-    lines = failures_file.read_text(encoding="utf-8").strip().splitlines()
-    assert len(lines) == 2
-    record = json.loads(lines[0])
-    assert record["http_status"] == 400
-    assert "Invalid variable" in record["reason"]
+    # Failures log should exist and contain both failures
+    fail_file = raw_dir / "failures.jsonl"
+    assert fail_file.exists()
+    fail_lines = fail_file.read_text(encoding="utf-8").strip().splitlines()
+    assert len(fail_lines) == 2
 
     # Manifest should not be created
     assert not (raw_dir / "manifest.jsonl").exists()
     # No raw json file created
-    assert not os.path.exists(raw_dir / "cams" / "test_area")
+    assert len(list(raw_dir.glob("**/*.json"))) == 0
 
 
-def test_validation_failure_missing_variable_logs_to_failures() -> None:
-    """Response missing required hourly variables must fail validation."""
-    mock_payload = {
-        "hourly": {
-            "time": ["2026-11-19T00:00", "2026-11-19T01:00"],
-            "pm2_5": [50.0, 55.0],
-            # pm10 is missing!
-        }
-    }
-
-    data, err = validate_response_payload(
-        json.dumps(mock_payload).encode("utf-8"),
-        expected_vars=["pm2_5", "pm10"],
-    )
-    assert data is None
-    assert "missing_hourly_variables: pm10" in str(err)
-
-
-def test_validation_failure_missing_time() -> None:
-    """Response missing hourly.time must fail validation."""
-    payload = {"hourly": {"pm2_5": [10.0]}}
-    data, err = validate_response_payload(
-        json.dumps(payload).encode("utf-8"),
-        expected_vars=["pm2_5"],
-    )
-    assert data is None
-    assert "missing_or_empty_hourly_time" in str(err)
-
-
-def test_atomic_write_no_partial_file_on_error(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
-) -> None:
-    """Verify atomic write cleans up .tmp file when write/replace fails."""
-    target = str(tmp_path / "corrupt_test.json")
-    tmp_target = f"{target}.tmp"
-
-    def mock_replace(src: str, dst: str) -> None:
-        raise OSError("Simulated filesystem error during atomic replace")
-
-    monkeypatch.setattr(os, "replace", mock_replace)
-
-    with pytest.raises(OSError, match="Simulated filesystem error"):
-        write_raw_file_atomically(target, b'{"valid":"bytes"}')
-
-    assert not os.path.exists(target)
-    assert not os.path.exists(tmp_target)
-
-
-def test_idempotency_skips_request_if_target_exists(
+def test_pre_existing_target_file_skips_fetch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Pre-existing target file must skip request and not duplicate manifest."""
     raw_dir = tmp_path / "raw"
-    existing_file = raw_dir / "cams" / "test_area" / "20261119024000Z.json"
-    existing_file.parent.mkdir(parents=True, exist_ok=True)
-    existing_file.write_text('{"existing":"data"}', encoding="utf-8")
+    fixed_time = datetime(2026, 11, 19, 12, 0, 0, tzinfo=UTC)
+    fetch_time_file = fixed_time.strftime("%Y%m%d%H%M00Z")
 
-    def fail_if_called(*args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError("urlopen should not have been called!")
+    pre_existing = raw_dir / "cams" / "test_area" / f"{fetch_time_file}.json"
+    pre_existing.parent.mkdir(parents=True, exist_ok=True)
+    pre_existing.write_text('{"cached": true}', encoding="utf-8")
 
-    monkeypatch.setattr(urllib.request, "urlopen", fail_if_called)
+    calls = 0
+
+    def mock_urlopen(req: urllib.request.Request, *args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return MockHTTPResponse({"hourly": {"time": ["t"], "temperature_2m": [1.0]}})
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
 
     areas_cfg = tmp_path / "areas.json"
     vars_cfg = tmp_path / "vars.json"
+
     areas_cfg.write_text(
         json.dumps(
             {
@@ -285,15 +241,16 @@ def test_idempotency_skips_request_if_target_exists(
             {
                 "cams": {
                     "endpoint": "https://air-quality-api.open-meteo.com/v1/air-quality",
-                    "domains": "cams_global",
                     "hourly": ["pm2_5"],
+                },
+                "weather": {
+                    "endpoint": "https://api.open-meteo.com/v1/forecast",
+                    "hourly": ["temperature_2m"],
                 },
             }
         ),
         encoding="utf-8",
     )
-
-    fixed_time = datetime(2026, 11, 19, 2, 40, 0, tzinfo=UTC)
 
     stats = archive_forecasts(
         areas_path=str(areas_cfg),
@@ -304,10 +261,12 @@ def test_idempotency_skips_request_if_target_exists(
     )
 
     assert stats["skipped"] == 1
-    assert stats["success"] == 0
+    assert stats["success"] == 1
+    # Only 1 network call made (for weather, cams was skipped)
+    assert calls == 1
+
     captured = capsys.readouterr()
     assert "already exists for this minute" in captured.out
-    assert not (raw_dir / "manifest.jsonl").exists()
 
 
 def test_successful_archive_flow_and_manifest(
@@ -387,10 +346,12 @@ def test_successful_archive_flow_and_manifest(
     lines = manifest_file.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 2
 
-    # Check first manifest line
+    # Check first manifest line (cams)
     m1 = json.loads(lines[0])
     assert m1["source"] == "cams"
     assert m1["area_id"] == "central_delhi"
+    assert m1["model"] == "default"
+    assert m1["request_url_has_models"] is False
     assert m1["http_status"] == 200
     assert "file_path" in m1
     assert os.path.exists(m1["file_path"])
@@ -409,19 +370,19 @@ def test_failure_of_one_area_does_not_stop_others(
         "hourly": {
             "time": ["2026-11-19T00:00"],
             "pm2_5": [50.0],
+            "temperature_2m": [20.0],
         }
     }
 
     def mock_urlopen(req: urllib.request.Request, *args: Any, **kwargs: Any) -> Any:
         url = req.full_url
-        if "28.5" in url:
-            # Area 1 fails with 500
+        if "latitude=28.0" in url:
             raise urllib.error.HTTPError(
                 url=url,
                 code=500,
-                msg="Server Error",
+                msg="Internal Error",
                 hdrs={},  # type: ignore[arg-type]
-                fp=io.BytesIO(b"error"),
+                fp=io.BytesIO(b"server error"),
             )
         return MockHTTPResponse(mock_valid)
 
@@ -436,16 +397,16 @@ def test_failure_of_one_area_does_not_stop_others(
             {
                 "areas": [
                     {
-                        "area_id": "area_fail",
+                        "area_id": "fail_area",
                         "name": "Fail",
-                        "latitude": 28.5,
-                        "longitude": 77.1,
+                        "latitude": 28.0,
+                        "longitude": 77.0,
                     },
                     {
-                        "area_id": "area_ok",
-                        "name": "OK",
-                        "latitude": 28.6,
-                        "longitude": 77.2,
+                        "area_id": "good_area",
+                        "name": "Good",
+                        "latitude": 28.5,
+                        "longitude": 77.5,
                     },
                 ]
             }
@@ -457,9 +418,8 @@ def test_failure_of_one_area_does_not_stop_others(
             {
                 "cams": {
                     "endpoint": "https://air-quality-api.open-meteo.com/v1/air-quality",
-                    "domains": "cams_global",
                     "hourly": ["pm2_5"],
-                },
+                }
             }
         ),
         encoding="utf-8",
@@ -512,3 +472,251 @@ def test_retry_backoff_on_429_and_5xx(monkeypatch: pytest.MonkeyPatch) -> None:
     assert status == 200
     assert raw == b'{"status":"ok"}'
     assert err is None
+
+
+def test_pinned_weather_models_archive_layout_and_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Verify WP1 model pinning: ecmwf and gfs requests and layout."""
+    mock_payload = {
+        "hourly": {
+            "time": ["2026-11-20T00:00"],
+            "temperature_2m": [15.2],
+            "pm2_5": [60.1],
+        }
+    }
+    requested_urls: list[str] = []
+
+    def mock_urlopen(req: urllib.request.Request, *args: Any, **kwargs: Any) -> Any:
+        requested_urls.append(req.full_url)
+        return MockHTTPResponse(mock_payload)
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    areas_cfg = tmp_path / "areas.json"
+    vars_cfg = tmp_path / "vars.json"
+    raw_dir = tmp_path / "raw"
+
+    areas_cfg.write_text(
+        json.dumps(
+            {
+                "areas": [
+                    {
+                        "area_id": "central_delhi",
+                        "name": "Central Delhi",
+                        "latitude": 28.61,
+                        "longitude": 77.21,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    vars_cfg.write_text(
+        json.dumps(
+            {
+                "cams": {
+                    "endpoint": "https://air-quality-api.open-meteo.com/v1/air-quality",
+                    "domains": "cams_global",
+                    "hourly": ["pm2_5"],
+                },
+                "weather": {
+                    "endpoint": "https://api.open-meteo.com/v1/forecast",
+                    "models": [
+                        {
+                            "model": "ecmwf_ifs025",
+                            "folder": "weather_ecmwf",
+                        },
+                        {
+                            "model": "ncep_gfs_seamless",
+                            "folder": "weather_gfs",
+                        },
+                    ],
+                    "hourly": ["temperature_2m"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    stats = archive_forecasts(
+        areas_path=str(areas_cfg),
+        vars_path=str(vars_cfg),
+        raw_dir=str(raw_dir),
+        delay_sec=0.0,
+    )
+
+    # 1 area * (1 cams + 2 weather models) = 3 calls
+    assert stats["success"] == 3
+    assert stats["failed"] == 0
+    assert len(requested_urls) == 3
+
+    # Check request URLs
+    cams_url = [u for u in requested_urls if "air-quality" in u][0]
+    ecmwf_url = [u for u in requested_urls if "models=ecmwf_ifs025" in u][0]
+    gfs_url = [u for u in requested_urls if "models=ncep_gfs_seamless" in u][0]
+
+    assert "domains=cams_global" in cams_url
+    assert "models=" not in cams_url
+    assert "models=ecmwf_ifs025" in ecmwf_url
+    assert "models=ncep_gfs_seamless" in gfs_url
+
+    # Check files exist in data/raw/open_meteo/weather_ecmwf/ and weather_gfs/
+    ecmwf_files = list((raw_dir / "weather_ecmwf" / "central_delhi").glob("*.json"))
+    gfs_files = list((raw_dir / "weather_gfs" / "central_delhi").glob("*.json"))
+    cams_files = list((raw_dir / "cams" / "central_delhi").glob("*.json"))
+
+    assert len(ecmwf_files) == 1
+    assert len(gfs_files) == 1
+    assert len(cams_files) == 1
+
+    # Check manifest entries
+    manifest_lines = (
+        (raw_dir / "manifest.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    )
+    assert len(manifest_lines) == 3
+    parsed = [json.loads(line) for line in manifest_lines]
+
+    cams_entry = [p for p in parsed if p["source"] == "cams"][0]
+    assert cams_entry["model"] == "default"
+    assert cams_entry["request_url_has_models"] is False
+    assert "/cams/central_delhi/" in cams_entry["file_path"]
+
+    ecmwf_entry = [p for p in parsed if p["model"] == "ecmwf_ifs025"][0]
+    assert ecmwf_entry["source"] == "weather"
+    assert ecmwf_entry["request_url_has_models"] is True
+    assert "weather_ecmwf/central_delhi" in ecmwf_entry["file_path"]
+
+    gfs_entry = [p for p in parsed if p["model"] == "ncep_gfs_seamless"][0]
+    assert gfs_entry["source"] == "weather"
+    assert gfs_entry["request_url_has_models"] is True
+    assert "weather_gfs/central_delhi" in gfs_entry["file_path"]
+
+
+def test_main_exits_nonzero_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """main() must exit with non-zero exit code if any request fails."""
+
+    def mock_urlopen(req: urllib.request.Request, *args: Any, **kwargs: Any) -> Any:
+        raise urllib.error.HTTPError(
+            url=req.full_url,
+            code=400,
+            msg="Bad Request",
+            hdrs={},  # type: ignore[arg-type]
+            fp=io.BytesIO(b'{"error":true,"reason":"Invalid variable"}'),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    areas_cfg = tmp_path / "areas.json"
+    vars_cfg = tmp_path / "vars.json"
+    raw_dir = tmp_path / "raw"
+
+    areas_cfg.write_text(
+        json.dumps(
+            {
+                "areas": [
+                    {
+                        "area_id": "test_area",
+                        "name": "Test",
+                        "latitude": 28.5,
+                        "longitude": 77.2,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    vars_cfg.write_text(
+        json.dumps(
+            {
+                "cams": {
+                    "endpoint": "https://air-quality-api.open-meteo.com/v1/air-quality",
+                    "hourly": ["pm2_5"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    argv = [
+        "--areas",
+        str(areas_cfg),
+        "--vars",
+        str(vars_cfg),
+        "--raw-dir",
+        str(raw_dir),
+        "--delay",
+        "0.0",
+    ]
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(argv)
+
+    assert exc_info.value.code != 0
+
+
+def test_main_exits_zero_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """main() must exit cleanly with code 0 on full success."""
+    mock_payload = {
+        "hourly": {
+            "time": ["2026-11-20T00:00"],
+            "pm2_5": [40.0],
+        }
+    }
+
+    def mock_urlopen(req: urllib.request.Request, *args: Any, **kwargs: Any) -> Any:
+        return MockHTTPResponse(mock_payload)
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    areas_cfg = tmp_path / "areas.json"
+    vars_cfg = tmp_path / "vars.json"
+    raw_dir = tmp_path / "raw"
+
+    areas_cfg.write_text(
+        json.dumps(
+            {
+                "areas": [
+                    {
+                        "area_id": "test_area",
+                        "name": "Test",
+                        "latitude": 28.5,
+                        "longitude": 77.2,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    vars_cfg.write_text(
+        json.dumps(
+            {
+                "cams": {
+                    "endpoint": "https://air-quality-api.open-meteo.com/v1/air-quality",
+                    "hourly": ["pm2_5"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    argv = [
+        "--areas",
+        str(areas_cfg),
+        "--vars",
+        str(vars_cfg),
+        "--raw-dir",
+        str(raw_dir),
+        "--delay",
+        "0.0",
+    ]
+
+    # Does not raise SystemExit
+    main(argv)

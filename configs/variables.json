@@ -19,6 +19,16 @@
     "endpoint": "https://api.open-meteo.com/v1/forecast",
     "forecast_days": 5,
     "timezone": "UTC",
+    "models": [
+      {
+        "model": "ecmwf_ifs025",
+        "folder": "weather_ecmwf"
+      },
+      {
+        "model": "ncep_gfs_seamless",
+        "folder": "weather_gfs"
+      }
+    ],
     "hourly": [
       "temperature_2m",
       "relative_humidity_2m",

@@ -40,6 +40,7 @@ def build_request_url(
     forecast_days: int = 5,
     timezone: str = "UTC",
     domains: str | None = None,
+    models: str | list[str] | None = None,
 ) -> str:
     """Build query URL for Open-Meteo endpoint."""
     params: dict[str, str | int] = {
@@ -51,6 +52,11 @@ def build_request_url(
     }
     if domains:
         params["domains"] = domains
+    if models:
+        if isinstance(models, list):
+            params["models"] = ",".join(models)
+        else:
+            params["models"] = models
 
     query_str = urllib.parse.urlencode(params)
     return f"{endpoint}?{query_str}"
@@ -224,105 +230,136 @@ def archive_forecasts(
             forecast_days = src_config.get("forecast_days", 5)
             timezone = src_config.get("timezone", "UTC")
             domains = src_config.get("domains")
+            models_config = src_config.get("models")
 
-            url = build_request_url(
-                endpoint=endpoint,
-                lat=lat,
-                lon=lon,
-                hourly_vars=hourly_vars,
-                forecast_days=forecast_days,
-                timezone=timezone,
-                domains=domains,
-            )
+            # Determine task list of (model_name, folder_name)
+            # If models_config is defined, iterate over configured models.
+            # If models_config is absent/None, run once with "default" model.
+            tasks: list[tuple[str, str]] = []
+            if models_config:
+                if isinstance(models_config, list):
+                    for m_item in models_config:
+                        if isinstance(m_item, dict):
+                            tasks.append(
+                                (
+                                    m_item["model"],
+                                    m_item.get("folder", f"{source}_{m_item['model']}"),
+                                )
+                            )
+                        elif isinstance(m_item, str):
+                            tasks.append((m_item, f"{source}_{m_item}"))
+                elif isinstance(models_config, dict):
+                    for folder_name, m_name in models_config.items():
+                        tasks.append((m_name, folder_name))
+            else:
+                tasks.append(("default", source))
 
-            target_path = os.path.join(
-                raw_dir, source, area_id, f"{fetch_time_file}.json"
-            )
-
-            if dry_run:
-                print(
-                    f"[DRY RUN] source={source} area={area_id} "
-                    f"target={target_path} url={url}"
+            for model_name, target_folder in tasks:
+                models_param = None if model_name == "default" else model_name
+                url = build_request_url(
+                    endpoint=endpoint,
+                    lat=lat,
+                    lon=lon,
+                    hourly_vars=hourly_vars,
+                    forecast_days=forecast_days,
+                    timezone=timezone,
+                    domains=domains,
+                    models=models_param,
                 )
-                continue
 
-            # Check if target file already exists BEFORE making request
-            if os.path.exists(target_path):
-                print(
-                    f"Skipping {source}/{area_id}: {target_path} already exists "
-                    "for this minute."
+                target_path = os.path.join(
+                    raw_dir, target_folder, area_id, f"{fetch_time_file}.json"
                 )
-                stats["skipped"] += 1
-                continue
 
-            # Respect request rate limit delay
-            if delay_sec > 0:
-                time.sleep(delay_sec)
+                if dry_run:
+                    print(
+                        f"[DRY RUN] source={source} area={area_id} "
+                        f"model={model_name} target={target_path} url={url}"
+                    )
+                    continue
 
-            # Perform network fetch
-            status_code, raw_bytes, error_reason = fetch_with_retries(
-                url, timeout=timeout, delay_sec=delay_sec
-            )
+                # Check if target file already exists BEFORE making request
+                if os.path.exists(target_path):
+                    print(
+                        f"Skipping {source}/{model_name}/{area_id}: "
+                        f"{target_path} already exists for this minute."
+                    )
+                    stats["skipped"] += 1
+                    continue
 
-            if status_code != 200:
-                print(
-                    f"Failure fetching {source}/{area_id} (HTTP {status_code}): "
-                    f"{error_reason}",
-                    file=sys.stderr,
+                # Respect request rate limit delay
+                if delay_sec > 0:
+                    time.sleep(delay_sec)
+
+                # Perform network fetch
+                status_code, raw_bytes, error_reason = fetch_with_retries(
+                    url, timeout=timeout, delay_sec=delay_sec
                 )
+
+                if status_code != 200:
+                    print(
+                        f"Failure fetching {source}/{model_name}/{area_id} "
+                        f"(HTTP {status_code}): {error_reason}",
+                        file=sys.stderr,
+                    )
+                    append_jsonl(
+                        failures_path,
+                        {
+                            "fetch_time_utc": fetch_time_iso,
+                            "source": source,
+                            "area_id": area_id,
+                            "model": model_name,
+                            "url": url,
+                            "http_status": status_code,
+                            "reason": error_reason or "http_failure",
+                        },
+                    )
+                    stats["failed"] += 1
+                    continue
+
+                # Validate response payload
+                _, val_err = validate_response_payload(raw_bytes, hourly_vars)
+                if val_err:
+                    print(
+                        f"Validation failed for {source}/{model_name}/{area_id}: "
+                        f"{val_err}",
+                        file=sys.stderr,
+                    )
+                    append_jsonl(
+                        failures_path,
+                        {
+                            "fetch_time_utc": fetch_time_iso,
+                            "source": source,
+                            "area_id": area_id,
+                            "model": model_name,
+                            "url": url,
+                            "http_status": 200,
+                            "reason": val_err,
+                        },
+                    )
+                    stats["failed"] += 1
+                    continue
+
+                # Write file atomically
+                write_raw_file_atomically(target_path, raw_bytes)
+
+                # Record in manifest
+                sha256_hash = hashlib.sha256(raw_bytes).hexdigest()
                 append_jsonl(
-                    failures_path,
+                    manifest_path,
                     {
                         "fetch_time_utc": fetch_time_iso,
                         "source": source,
                         "area_id": area_id,
-                        "url": url,
-                        "http_status": status_code,
-                        "reason": error_reason or "http_failure",
-                    },
-                )
-                stats["failed"] += 1
-                continue
-
-            # Validate response payload
-            _, val_err = validate_response_payload(raw_bytes, hourly_vars)
-            if val_err:
-                print(
-                    f"Validation failed for {source}/{area_id}: {val_err}",
-                    file=sys.stderr,
-                )
-                append_jsonl(
-                    failures_path,
-                    {
-                        "fetch_time_utc": fetch_time_iso,
-                        "source": source,
-                        "area_id": area_id,
+                        "model": model_name,
+                        "request_url_has_models": "models=" in url,
                         "url": url,
                         "http_status": 200,
-                        "reason": val_err,
+                        "sha256": sha256_hash,
+                        "file_path": target_path.replace("\\", "/"),
                     },
                 )
-                stats["failed"] += 1
-                continue
-
-            # Write file atomically
-            write_raw_file_atomically(target_path, raw_bytes)
-
-            # Record in manifest
-            sha256_hash = hashlib.sha256(raw_bytes).hexdigest()
-            append_jsonl(
-                manifest_path,
-                {
-                    "fetch_time_utc": fetch_time_iso,
-                    "source": source,
-                    "area_id": area_id,
-                    "url": url,
-                    "http_status": 200,
-                    "sha256": sha256_hash,
-                    "file_path": target_path.replace("\\", "/"),
-                },
-            )
-            stats["success"] += 1
+                stats["success"] += 1
 
     return stats
 
@@ -366,8 +403,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     stats = archive_forecasts(
         areas_path=args.areas,
         vars_path=args.vars,
@@ -381,6 +418,8 @@ def main() -> None:
             f"Archive run finished: {stats['success']} saved, "
             f"{stats['skipped']} skipped, {stats['failed']} failed."
         )
+    if stats["failed"] > 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
