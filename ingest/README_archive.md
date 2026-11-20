@@ -57,3 +57,28 @@ Usage:
 ```bash
 python scripts/status_archive.py --manifest data/raw/open_meteo/manifest.jsonl
 ```
+
+## GitHub Actions Automated Archive (WP2)
+
+### How It Works
+Automated scheduled archiving is managed by the GitHub Actions workflow at `.github/workflows/archive.yml`:
+- **Schedule**: Runs 4 times daily at `01:17`, `07:17`, `13:17`, and `19:17` UTC (odd minutes to avoid top-of-hour queue contention). It also supports manual on-demand execution via `workflow_dispatch`.
+- **Note on Timing**: Scheduled runs on GitHub Actions can start late depending on runner queue delays; exact wall-clock timing is not guaranteed.
+- **Orphan Branch Storage**: Raw data **never** touches `main`. The workflow maintains a completely separate, orphan branch named `archive-data`. The workflow checks out `main` into the runner root, checks out (or initializes) `archive-data` into a subfolder `archive-data/`, and executes `python -m ingest.archive_open_meteo --raw-dir archive-data`.
+- **Failure Resilience**: If any fetch request fails, the archive script exits with a non-zero exit code so the GitHub Actions job turns red. However, the commit and push step runs with `if: always()`, ensuring partial data and failure records (`failures.jsonl`) are preserved on `archive-data`.
+- **Bot Identity**: Commits on `archive-data` are authored by the standard bot identity:
+  - Name: `github-actions[bot]`
+  - Email: `41898282+github-actions[bot]@users.noreply.github.com`
+- **Concurrency**: Governed by concurrency group `archive-open-meteo` with `cancel-in-progress: false` to prevent overlapping runs.
+
+### How to Disable It
+- **Via GitHub Web UI**: In the repository on GitHub, navigate to **Actions** -> select the **Scheduled Open-Meteo Forecast Archive** workflow in the left sidebar -> click the three dots menu (`...`) on the right -> select **Disable workflow**.
+- **Via Git**: Comment out or delete the `schedule:` trigger block in `.github/workflows/archive.yml` and commit/push to `main`.
+
+### Dual Independent Archives & De-duplication
+Forecasts may be collected independently by two distinct sources:
+1. **Local Archive**: Manual or local runs on a developer laptop (stored under `data/raw/open_meteo/`).
+2. **Actions Archive**: Cloud runs on GitHub Actions (stored in the orphan branch `archive-data`).
+
+Because both archives write immutable raw JSON payloads and log an audit record containing the `sha256` hash of the response bytes in `manifest.jsonl`, downstream consolidation tools can safely de-duplicate files across both archives using their SHA-256 digest and fetch timestamps without risk of duplicate training rows or data contamination.
+

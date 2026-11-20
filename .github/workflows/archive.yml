@@ -1,0 +1,77 @@
+name: Scheduled Open-Meteo Forecast Archive
+
+'on':
+  schedule:
+    # 4 times daily at 01:17, 07:17, 13:17, 19:17 UTC (odd minute to avoid top-of-hour contention).
+    # Note: Scheduled workflow runs on GitHub Actions can start late depending on queue delays; exact timing is not guaranteed.
+    - cron: "17 1,7,13,19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: archive-open-meteo
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out main repository
+        # Verified latest release: v7.0.1 (https://github.com/actions/checkout/releases/tag/v7.0.1)
+        uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Check out archive-data branch into subfolder
+        # Verified latest release: v7.0.1 (https://github.com/actions/checkout/releases/tag/v7.0.1)
+        uses: actions/checkout@v7
+        continue-on-error: true
+        id: checkout-archive-data
+        with:
+          ref: archive-data
+          path: archive-data
+
+      - name: Initialize archive-data orphan branch if missing
+        if: steps.checkout-archive-data.outcome != 'success'
+        run: |
+          rm -rf archive-data
+          mkdir -p archive-data
+          cd archive-data
+          git init -b archive-data
+
+      - name: Set up Python 3.12
+        # Verified latest release: v7.1.0 (https://github.com/actions/setup-python/releases/tag/v7.1.0)
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Run archive script
+        run: |
+          python -m ingest.archive_open_meteo --raw-dir archive-data
+
+      - name: Commit and push raw data
+        if: always()
+        run: |
+          if [ -d "archive-data" ]; then
+            cd archive-data
+            git config --global --add safe.directory "*"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            if git remote get-url origin > /dev/null 2>&1; then
+              git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+            else
+              git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+            fi
+            git add .
+            if git diff --staged --quiet; then
+              echo "No new files to commit."
+            else
+              git commit -m "data(archive): save Open-Meteo forecasts [skip ci]"
+              git push -u origin archive-data
+            fi
+          else
+            echo "archive-data directory not found, skipping push."
+          fi
