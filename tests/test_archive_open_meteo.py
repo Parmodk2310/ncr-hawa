@@ -18,6 +18,8 @@ from ingest.archive_open_meteo import (
     build_request_url,
     fetch_with_retries,
     main,
+    validate_response_payload,
+    write_raw_file_atomically,
 )
 
 
@@ -160,7 +162,8 @@ def test_http_400_handling_logs_to_failures_no_archive(
             {
                 "cams": {
                     "endpoint": "https://air-quality-api.open-meteo.com/v1/air-quality",
-                    "hourly": ["pm2_5"],
+                    "domains": "cams_global",
+                    "hourly": ["invalid_var"],
                 },
                 "weather": {
                     "endpoint": "https://api.open-meteo.com/v1/forecast",
@@ -183,40 +186,83 @@ def test_http_400_handling_logs_to_failures_no_archive(
     assert stats["failed"] == 2
     assert stats["success"] == 0
 
-    # Failures log should exist and contain both failures
-    fail_file = raw_dir / "failures.jsonl"
-    assert fail_file.exists()
-    fail_lines = fail_file.read_text(encoding="utf-8").strip().splitlines()
-    assert len(fail_lines) == 2
+    failures_file = raw_dir / "failures.jsonl"
+    assert failures_file.exists()
+    lines = failures_file.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    record = json.loads(lines[0])
+    assert record["http_status"] == 400
+    assert "Invalid variable" in record["reason"]
 
     # Manifest should not be created
     assert not (raw_dir / "manifest.jsonl").exists()
     # No raw json file created
-    assert len(list(raw_dir.glob("**/*.json"))) == 0
+    assert not os.path.exists(raw_dir / "cams" / "test_area")
 
 
-def test_pre_existing_target_file_skips_fetch(
+def test_validation_failure_missing_variable_logs_to_failures() -> None:
+    """Response missing required hourly variables must fail validation."""
+    mock_payload = {
+        "hourly": {
+            "time": ["2026-11-19T00:00", "2026-11-19T01:00"],
+            "pm2_5": [50.0, 55.0],
+            # pm10 is missing!
+        }
+    }
+
+    data, err = validate_response_payload(
+        json.dumps(mock_payload).encode("utf-8"),
+        expected_vars=["pm2_5", "pm10"],
+    )
+    assert data is None
+    assert "missing_hourly_variables: pm10" in str(err)
+
+
+def test_validation_failure_missing_time() -> None:
+    """Response missing hourly.time must fail validation."""
+    payload = {"hourly": {"pm2_5": [10.0]}}
+    data, err = validate_response_payload(
+        json.dumps(payload).encode("utf-8"),
+        expected_vars=["pm2_5"],
+    )
+    assert data is None
+    assert "missing_or_empty_hourly_time" in str(err)
+
+
+def test_atomic_write_no_partial_file_on_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Verify atomic write cleans up .tmp file when write/replace fails."""
+    target = str(tmp_path / "corrupt_test.json")
+    tmp_target = f"{target}.tmp"
+
+    def mock_replace(src: str, dst: str) -> None:
+        raise OSError("Simulated filesystem error during atomic replace")
+
+    monkeypatch.setattr(os, "replace", mock_replace)
+
+    with pytest.raises(OSError, match="Simulated filesystem error"):
+        write_raw_file_atomically(target, b'{"valid":"bytes"}')
+
+    assert not os.path.exists(target)
+    assert not os.path.exists(tmp_target)
+
+
+def test_idempotency_skips_request_if_target_exists(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Pre-existing target file must skip request and not duplicate manifest."""
     raw_dir = tmp_path / "raw"
-    fixed_time = datetime(2026, 11, 19, 12, 0, 0, tzinfo=UTC)
-    fetch_time_file = fixed_time.strftime("%Y%m%d%H%M00Z")
+    existing_file = raw_dir / "cams" / "test_area" / "20261119024000Z.json"
+    existing_file.parent.mkdir(parents=True, exist_ok=True)
+    existing_file.write_text('{"existing":"data"}', encoding="utf-8")
 
-    pre_existing = raw_dir / "cams" / "test_area" / f"{fetch_time_file}.json"
-    pre_existing.parent.mkdir(parents=True, exist_ok=True)
-    pre_existing.write_text('{"cached": true}', encoding="utf-8")
+    def fail_if_called(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("urlopen should not have been called!")
 
-    calls = 0
-
-    def mock_urlopen(req: urllib.request.Request, *args: Any, **kwargs: Any) -> Any:
-        nonlocal calls
-        calls += 1
-        return MockHTTPResponse({"hourly": {"time": ["t"], "temperature_2m": [1.0]}})
-
-    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+    monkeypatch.setattr(urllib.request, "urlopen", fail_if_called)
 
     areas_cfg = tmp_path / "areas.json"
     vars_cfg = tmp_path / "vars.json"
@@ -241,16 +287,15 @@ def test_pre_existing_target_file_skips_fetch(
             {
                 "cams": {
                     "endpoint": "https://air-quality-api.open-meteo.com/v1/air-quality",
+                    "domains": "cams_global",
                     "hourly": ["pm2_5"],
-                },
-                "weather": {
-                    "endpoint": "https://api.open-meteo.com/v1/forecast",
-                    "hourly": ["temperature_2m"],
                 },
             }
         ),
         encoding="utf-8",
     )
+
+    fixed_time = datetime(2026, 11, 19, 2, 40, 0, tzinfo=UTC)
 
     stats = archive_forecasts(
         areas_path=str(areas_cfg),
@@ -261,12 +306,10 @@ def test_pre_existing_target_file_skips_fetch(
     )
 
     assert stats["skipped"] == 1
-    assert stats["success"] == 1
-    # Only 1 network call made (for weather, cams was skipped)
-    assert calls == 1
-
+    assert stats["success"] == 0
     captured = capsys.readouterr()
     assert "already exists for this minute" in captured.out
+    assert not (raw_dir / "manifest.jsonl").exists()
 
 
 def test_successful_archive_flow_and_manifest(
@@ -346,7 +389,7 @@ def test_successful_archive_flow_and_manifest(
     lines = manifest_file.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 2
 
-    # Check first manifest line (cams)
+    # Check first manifest line
     m1 = json.loads(lines[0])
     assert m1["source"] == "cams"
     assert m1["area_id"] == "central_delhi"
@@ -370,19 +413,19 @@ def test_failure_of_one_area_does_not_stop_others(
         "hourly": {
             "time": ["2026-11-19T00:00"],
             "pm2_5": [50.0],
-            "temperature_2m": [20.0],
         }
     }
 
     def mock_urlopen(req: urllib.request.Request, *args: Any, **kwargs: Any) -> Any:
         url = req.full_url
-        if "latitude=28.0" in url:
+        if "28.5" in url:
+            # Area 1 fails with 500
             raise urllib.error.HTTPError(
                 url=url,
                 code=500,
-                msg="Internal Error",
+                msg="Server Error",
                 hdrs={},  # type: ignore[arg-type]
-                fp=io.BytesIO(b"server error"),
+                fp=io.BytesIO(b"error"),
             )
         return MockHTTPResponse(mock_valid)
 
@@ -397,16 +440,16 @@ def test_failure_of_one_area_does_not_stop_others(
             {
                 "areas": [
                     {
-                        "area_id": "fail_area",
+                        "area_id": "area_fail",
                         "name": "Fail",
-                        "latitude": 28.0,
-                        "longitude": 77.0,
+                        "latitude": 28.5,
+                        "longitude": 77.1,
                     },
                     {
-                        "area_id": "good_area",
-                        "name": "Good",
-                        "latitude": 28.5,
-                        "longitude": 77.5,
+                        "area_id": "area_ok",
+                        "name": "OK",
+                        "latitude": 28.6,
+                        "longitude": 77.2,
                     },
                 ]
             }
@@ -418,8 +461,9 @@ def test_failure_of_one_area_does_not_stop_others(
             {
                 "cams": {
                     "endpoint": "https://air-quality-api.open-meteo.com/v1/air-quality",
+                    "domains": "cams_global",
                     "hourly": ["pm2_5"],
-                }
+                },
             }
         ),
         encoding="utf-8",
