@@ -17,6 +17,7 @@ concurrency:
 jobs:
   archive:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Check out main repository
@@ -54,6 +55,8 @@ jobs:
 
       - name: Commit and push raw data
         if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ -d "archive-data" ]; then
             cd archive-data
@@ -61,9 +64,9 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             if git remote get-url origin > /dev/null 2>&1; then
-              git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+              git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
             else
-              git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+              git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
             fi
             git add .
             if git diff --staged --quiet; then
@@ -74,4 +77,20 @@ jobs:
             fi
           else
             echo "archive-data directory not found, skipping push."
+          fi
+
+      - name: Report archive-data commit status
+        if: always()
+        run: |
+          if [ -d "archive-data/.git" ]; then
+            cd archive-data
+            if git rev-parse --verify HEAD >/dev/null 2>&1; then
+              COUNT=$(git diff-tree --no-commit-id --name-only -r --root HEAD | wc -l)
+              echo "Files in latest archive-data commit: $COUNT"
+              git log -1 --stat
+            else
+              echo "No commits found in archive-data branch."
+            fi
+          else
+            echo "archive-data git repository not found."
           fi

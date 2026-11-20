@@ -211,3 +211,251 @@ def test_status_archive_cli_execution(
     assert "Open-Meteo Forecast Archive Status Report" in captured.out
     assert "Age of last fetch: 2.00 hours" in captured.out
     assert "2026-11-20: 1 run(s)" in captured.out
+
+
+def test_hand_made_manifest_complete_run(tmp_path: Any) -> None:
+    """Clustered run with all expected forecast targets is flagged COMPLETE."""
+    areas_cfg = tmp_path / "areas.json"
+    vars_cfg = tmp_path / "vars.json"
+    manifest_file = tmp_path / "manifest.jsonl"
+
+    areas_cfg.write_text(
+        json.dumps(
+            {
+                "areas": [
+                    {"area_id": "area_a"},
+                    {"area_id": "area_b"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    vars_cfg.write_text(
+        json.dumps(
+            {
+                "weather": {
+                    "models": [
+                        {"model": "ecmwf_ifs025"},
+                        {"model": "ncep_gfs_seamless"},
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # 2 areas * (1 cams + 2 weather) = 6 expected files per run
+    entries = [
+        {
+            "fetch_time_utc": "2026-11-20T01:17:00Z",
+            "source": "cams",
+            "area_id": "area_a",
+            "model": "default",
+        },
+        {
+            "fetch_time_utc": "2026-11-20T01:17:01Z",
+            "source": "cams",
+            "area_id": "area_b",
+            "model": "default",
+        },
+        {
+            "fetch_time_utc": "2026-11-20T01:17:02Z",
+            "source": "weather",
+            "area_id": "area_a",
+            "model": "ecmwf_ifs025",
+        },
+        {
+            "fetch_time_utc": "2026-11-20T01:17:03Z",
+            "source": "weather",
+            "area_id": "area_b",
+            "model": "ecmwf_ifs025",
+        },
+        {
+            "fetch_time_utc": "2026-11-20T01:17:04Z",
+            "source": "weather",
+            "area_id": "area_a",
+            "model": "ncep_gfs_seamless",
+        },
+        {
+            "fetch_time_utc": "2026-11-20T01:17:05Z",
+            "source": "weather",
+            "area_id": "area_b",
+            "model": "ncep_gfs_seamless",
+        },
+    ]
+    with open(manifest_file, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+    status = compute_archive_status(
+        manifest_path=str(manifest_file),
+        areas_path=str(areas_cfg),
+        vars_path=str(vars_cfg),
+        now_utc=datetime(2026, 11, 20, 2, 0, 0, tzinfo=UTC),
+    )
+
+    assert status["runs_count"] == 1
+    assert status["expected_files_per_run"] == 6
+    run1 = status["runs"][0]
+    assert run1["file_count"] == 6
+    assert run1["is_incomplete"] is False
+    assert run1["status"] == "COMPLETE"
+    assert run1["missing"] == []
+
+    report = format_status_report(status)
+    assert "Expected files per run: 6" in report
+    assert "Run 1 (2026-11-20T01:17:00Z): 6/6 files" in report
+    assert "[INCOMPLETE]" not in report
+
+
+def test_hand_made_manifest_incomplete_run(tmp_path: Any) -> None:
+    """Clustered run missing targets is flagged INCOMPLETE with details."""
+    areas_cfg = tmp_path / "areas.json"
+    vars_cfg = tmp_path / "vars.json"
+    manifest_file = tmp_path / "manifest.jsonl"
+
+    areas_cfg.write_text(
+        json.dumps(
+            {
+                "areas": [
+                    {"area_id": "delhi"},
+                    {"area_id": "noida"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    vars_cfg.write_text(
+        json.dumps(
+            {
+                "weather": {
+                    "models": [
+                        {"model": "ecmwf_ifs025"},
+                        {"model": "ncep_gfs_seamless"},
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # 6 expected, but only 4 provided:
+    # missing cams/noida and weather[ncep_gfs_seamless]/delhi
+    entries = [
+        {
+            "fetch_time_utc": "2026-11-20T01:17:00Z",
+            "source": "cams",
+            "area_id": "delhi",
+            "model": "default",
+        },
+        {
+            "fetch_time_utc": "2026-11-20T01:17:02Z",
+            "source": "weather",
+            "area_id": "delhi",
+            "model": "ecmwf_ifs025",
+        },
+        {
+            "fetch_time_utc": "2026-11-20T01:17:03Z",
+            "source": "weather",
+            "area_id": "noida",
+            "model": "ecmwf_ifs025",
+        },
+        {
+            "fetch_time_utc": "2026-11-20T01:17:05Z",
+            "source": "weather",
+            "area_id": "noida",
+            "model": "ncep_gfs_seamless",
+        },
+    ]
+    with open(manifest_file, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+    status = compute_archive_status(
+        manifest_path=str(manifest_file),
+        areas_path=str(areas_cfg),
+        vars_path=str(vars_cfg),
+        now_utc=datetime(2026, 11, 20, 2, 0, 0, tzinfo=UTC),
+    )
+
+    assert status["runs_count"] == 1
+    run1 = status["runs"][0]
+    assert run1["file_count"] == 4
+    assert run1["expected_count"] == 6
+    assert run1["is_incomplete"] is True
+    assert run1["status"] == "INCOMPLETE"
+    assert "cams/noida" in run1["missing"]
+    assert "weather[ncep_gfs_seamless]/delhi" in run1["missing"]
+
+    report = format_status_report(status)
+    assert "[INCOMPLETE]" in report
+    assert "cams/noida" in report
+    assert "weather[ncep_gfs_seamless]/delhi" in report
+
+
+def test_hand_made_log_start_without_exit(tmp_path: Any) -> None:
+    """Flag start lines lacking matching exit= as START WITHOUT EXIT."""
+    manifest_file = tmp_path / "manifest.jsonl"
+    manifest_file.write_text("", encoding="utf-8")
+    log_file = tmp_path / "run.log"
+
+    log_content = (
+        "2026-11-20T01:17:00Z start archive run\n"
+        "2026-11-20T01:17:15Z exit=0\n"
+        "2026-11-20T07:17:00Z start archive run\n"  # Missing exit before next start!
+        "2026-11-20T13:17:00Z start archive run\n"
+        "2026-11-20T13:17:15Z exit=0\n"
+        "2026-11-20T19:17:00Z start archive run\n"  # Missing exit before EOF!
+    )
+    log_file.write_text(log_content, encoding="utf-8")
+
+    status = compute_archive_status(
+        manifest_path=str(manifest_file),
+        log_path=str(log_file),
+    )
+
+    log_info = status["log_status"]
+    assert log_info is not None
+    assert log_info["exists"] is True
+    assert log_info["total_starts"] == 4
+    assert len(log_info["unmatched_starts"]) == 2
+
+    # Line 3 and Line 6 flagged
+    flagged_lines = [item["line_num"] for item in log_info["unmatched_starts"]]
+    assert flagged_lines == [3, 6]
+    for item in log_info["unmatched_starts"]:
+        assert item["flag"] == "START WITHOUT EXIT"
+
+    report = format_status_report(status)
+    assert (
+        'Line 3: "2026-11-20T07:17:00Z start archive run" [START WITHOUT EXIT]'
+        in report
+    )
+    assert (
+        'Line 6: "2026-11-20T19:17:00Z start archive run" [START WITHOUT EXIT]'
+        in report
+    )
+
+
+def test_hand_made_log_empty(tmp_path: Any) -> None:
+    """Empty run log parses cleanly with 0 starts and no flags."""
+    manifest_file = tmp_path / "manifest.jsonl"
+    manifest_file.write_text("", encoding="utf-8")
+    log_file = tmp_path / "run.log"
+    log_file.write_text("", encoding="utf-8")
+
+    status = compute_archive_status(
+        manifest_path=str(manifest_file),
+        log_path=str(log_file),
+    )
+
+    log_info = status["log_status"]
+    assert log_info is not None
+    assert log_info["exists"] is True
+    assert log_info["total_lines"] == 0
+    assert log_info["total_starts"] == 0
+    assert log_info["unmatched_starts"] == []
+
+    report = format_status_report(status)
+    assert "File is empty." in report
+    assert "[START WITHOUT EXIT]" not in report

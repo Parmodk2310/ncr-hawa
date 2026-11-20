@@ -44,31 +44,36 @@ Raw payloads are stored under `data/raw/open_meteo/`:
 
 - **`data/raw/open_meteo/failures.jsonl`**: Records any client errors (e.g., HTTP 400), server errors, or validation errors (missing `hourly.time` or requested variables). Invalid responses are never saved to the archive.
 
-## Archive Health Monitoring
+## Archive Health Monitoring (WP1, WP2b)
 
 The script `scripts/status_archive.py` reads `manifest.jsonl` and reports:
 1. **Runs per day**: Grouped by UTC date, where fetches within 10 minutes are clustered into one run.
-2. **Hours between consecutive runs**: Time elapsed between runs.
-3. **GAP alerts**: Any interval between consecutive runs exceeding 7.0 hours is flagged `[GAP]`.
+2. **Completeness per clustered run**: Computes expected files per run as:
+   $$\text{Expected Files} = \text{number of areas} \times (1\text{ CAMS} + \text{number of configured weather models})$$
+   read directly from `configs/areas.json` and `configs/variables.json` (e.g., $5 \times (1 + 2) = 15$ files per run).
+   If a clustered run has fewer files than expected, it is flagged **`[INCOMPLETE]`** along with the list of missing source/area targets (e.g. `cams/noida`, `weather[ncep_gfs_seamless]/faridabad`).
+3. **Hours between consecutive runs & GAP alerts**: Time elapsed between runs. Any interval exceeding 7.0 hours is flagged **`[GAP]`**.
 4. **Age of last fetch**: Elapsed hours since the most recent fetch timestamp.
 5. **File counts and storage size**: Total files recorded and total size in MB on disk.
+6. **Execution log audit (`--log <run.log>`)**: Scans execution logs to ensure clean job completion. Any `start` line lacking a matching `exit=` line before the next `start` or EOF is flagged **`[START WITHOUT EXIT]`**.
 
 Usage:
 ```bash
-python scripts/status_archive.py --manifest data/raw/open_meteo/manifest.jsonl
+python scripts/status_archive.py --manifest data/raw/open_meteo/manifest.jsonl --log run.log
 ```
 
-## GitHub Actions Automated Archive (WP2)
+## GitHub Actions Automated Archive (WP2, WP2b)
 
 ### How It Works
 Automated scheduled archiving is managed by the GitHub Actions workflow at `.github/workflows/archive.yml`:
 - **Schedule**: Runs 4 times daily at `01:17`, `07:17`, `13:17`, and `19:17` UTC (odd minutes to avoid top-of-hour queue contention). It also supports manual on-demand execution via `workflow_dispatch`.
+- **Job Guardrails**: A job timeout of `timeout-minutes: 10` prevents hanging runner jobs.
 - **Note on Timing**: Scheduled runs on GitHub Actions can start late depending on runner queue delays; exact wall-clock timing is not guaranteed.
 - **Orphan Branch Storage**: Raw data **never** touches `main`. The workflow maintains a completely separate, orphan branch named `archive-data`. The workflow checks out `main` into the runner root, checks out (or initializes) `archive-data` into a subfolder `archive-data/`, and executes `python -m ingest.archive_open_meteo --raw-dir archive-data`.
-- **Failure Resilience**: If any fetch request fails, the archive script exits with a non-zero exit code so the GitHub Actions job turns red. However, the commit and push step runs with `if: always()`, ensuring partial data and failure records (`failures.jsonl`) are preserved on `archive-data`.
-- **Bot Identity**: Commits on `archive-data` are authored by the standard bot identity:
+- **Security & Bot Identity**: Authentication uses a step-level environment variable `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` rather than exposing tokens in git command arguments or URLs. Commits on `archive-data` are authored by the standard bot identity:
   - Name: `github-actions[bot]`
   - Email: `41898282+github-actions[bot]@users.noreply.github.com`
+- **Failure Resilience & Reporting**: If any fetch request fails, the archive script exits with a non-zero exit code so the GitHub Actions job turns red. However, the commit and push step runs with `if: always()`, ensuring partial data and failure records (`failures.jsonl`) are preserved on `archive-data`. A final step (`if: always()`) reports the exact number of committed files and prints `git log -1 --stat` for the archive branch.
 - **Concurrency**: Governed by concurrency group `archive-open-meteo` with `cancel-in-progress: false` to prevent overlapping runs.
 
 ### How to Disable It

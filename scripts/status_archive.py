@@ -45,14 +45,149 @@ def cluster_fetches_into_runs(
     return runs
 
 
+def load_forecast_configs(
+    areas_path: str = "configs/areas.json",
+    vars_path: str = "configs/variables.json",
+) -> tuple[list[str], list[str]]:
+    """Load area IDs and configured weather model names from config JSONs."""
+    areas: list[str] = []
+    if os.path.exists(areas_path):
+        try:
+            with open(areas_path, encoding="utf-8") as f:
+                data = json.load(f)
+                areas = [a["area_id"] for a in data.get("areas", []) if "area_id" in a]
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    weather_models: list[str] = []
+    if os.path.exists(vars_path):
+        try:
+            with open(vars_path, encoding="utf-8") as f:
+                vars_cfg = json.load(f)
+                raw_models = vars_cfg.get("weather", {}).get("models", [])
+                for item in raw_models:
+                    if isinstance(item, dict) and "model" in item:
+                        weather_models.append(item["model"])
+                    elif isinstance(item, str):
+                        weather_models.append(item)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    return areas, weather_models
+
+
+def get_expected_targets(
+    areas: list[str],
+    weather_models: list[str],
+) -> list[tuple[str, str, str]]:
+    """Generate list of expected (source, model, area_id) tuples."""
+    targets: list[tuple[str, str, str]] = []
+    for area in areas:
+        targets.append(("cams", "default", area))
+    for model in weather_models:
+        for area in areas:
+            targets.append(("weather", model, area))
+    return targets
+
+
+def format_target_label(source: str, model: str, area_id: str) -> str:
+    """Format target as readable label, e.g. cams/area or weather[model]/area."""
+    if source == "cams" or model == "default":
+        return f"{source}/{area_id}"
+    return f"{source}[{model}]/{area_id}"
+
+
+def entry_matches_target(entry: dict[str, Any], target: tuple[str, str, str]) -> bool:
+    """Check if a manifest entry satisfies an expected target tuple."""
+    src, mdl, aid = target
+    e_src = entry.get("source")
+    e_aid = entry.get("area_id")
+    e_mdl = entry.get("model", "default")
+    if e_src != src or e_aid != aid:
+        return False
+    if src == "cams":
+        return True
+    return e_mdl == mdl or (e_mdl == "default" and mdl == "default")
+
+
+def parse_run_log(log_path: str) -> dict[str, Any]:
+    """Parse run log and flag starts without matching exit= before next start or EOF."""
+    if not os.path.exists(log_path):
+        return {
+            "log_path": log_path,
+            "exists": False,
+            "total_lines": 0,
+            "total_starts": 0,
+            "unmatched_starts": [],
+        }
+
+    lines: list[str] = []
+    with open(log_path, encoding="utf-8") as f:
+        lines = f.readlines()
+
+    total_starts = 0
+    unmatched_starts: list[dict[str, Any]] = []
+    current_start: dict[str, Any] | None = None
+
+    for idx, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        lower_line = line.lower()
+        is_start = "start" in lower_line and "exit=" not in lower_line
+        is_exit = "exit=" in lower_line
+
+        if is_start:
+            total_starts += 1
+            if current_start is not None:
+                unmatched_starts.append(
+                    {
+                        "line_num": current_start["line_num"],
+                        "line": current_start["line"],
+                        "flag": "START WITHOUT EXIT",
+                    }
+                )
+            current_start = {"line_num": idx, "line": line}
+        elif is_exit:
+            if current_start is not None:
+                current_start = None
+
+    if current_start is not None:
+        unmatched_starts.append(
+            {
+                "line_num": current_start["line_num"],
+                "line": current_start["line"],
+                "flag": "START WITHOUT EXIT",
+            }
+        )
+
+    return {
+        "log_path": log_path,
+        "exists": True,
+        "total_lines": len(lines),
+        "total_starts": total_starts,
+        "unmatched_starts": unmatched_starts,
+    }
+
+
 def compute_archive_status(
     manifest_path: str,
+    areas_path: str = "configs/areas.json",
+    vars_path: str = "configs/variables.json",
     now_utc: datetime | None = None,
     gap_threshold_hours: float = 7.0,
     run_gap_minutes: float = 10.0,
+    log_path: str | None = None,
 ) -> dict[str, Any]:
-    """Compute archive health and continuity metrics from manifest.jsonl."""
+    """Compute archive health, completeness, and continuity metrics."""
     current_time = now_utc or datetime.now(UTC)
+
+    areas, weather_models = load_forecast_configs(areas_path, vars_path)
+    expected_files_per_run = len(areas) * (1 + len(weather_models)) if areas else 0
+    expected_targets = get_expected_targets(areas, weather_models)
+
+    log_status = parse_run_log(log_path) if log_path else None
 
     if not os.path.exists(manifest_path):
         return {
@@ -60,12 +195,15 @@ def compute_archive_status(
             "exists": False,
             "total_entries": 0,
             "runs_count": 0,
+            "expected_files_per_run": expected_files_per_run,
+            "runs": [],
             "runs_per_day": {},
             "intervals": [],
             "age_hours": None,
             "last_fetch_utc": None,
             "file_count": 0,
             "total_size_mb": 0.0,
+            "log_status": log_status,
         }
 
     entries: list[dict[str, Any]] = []
@@ -85,22 +223,25 @@ def compute_archive_status(
             "exists": True,
             "total_entries": 0,
             "runs_count": 0,
+            "expected_files_per_run": expected_files_per_run,
+            "runs": [],
             "runs_per_day": {},
             "intervals": [],
             "age_hours": None,
             "last_fetch_utc": None,
             "file_count": 0,
             "total_size_mb": 0.0,
+            "log_status": log_status,
         }
 
-    timestamps: list[datetime] = []
+    valid_entries: list[tuple[datetime, dict[str, Any]]] = []
     file_paths: list[str] = []
 
     for entry in entries:
         ts_str = entry.get("fetch_time_utc")
         if ts_str:
             try:
-                timestamps.append(parse_iso_utc(ts_str))
+                valid_entries.append((parse_iso_utc(ts_str), entry))
             except ValueError:
                 pass
         f_path = entry.get("file_path")
@@ -133,16 +274,70 @@ def compute_archive_status(
                 pass
 
     total_size_mb = total_bytes / (1024.0 * 1024.0)
-    runs = cluster_fetches_into_runs(timestamps, max_gap_minutes=run_gap_minutes)
 
+    # Cluster entries into runs
+    valid_entries.sort(key=lambda x: x[0])
+    max_gap_seconds = run_gap_minutes * 60.0
+    clustered_entry_runs: list[list[dict[str, Any]]] = []
+    clustered_ts_runs: list[list[datetime]] = []
+
+    current_entry_run: list[dict[str, Any]] = []
+    current_ts_run: list[datetime] = []
+
+    for dt, entry in valid_entries:
+        if not current_ts_run:
+            current_ts_run.append(dt)
+            current_entry_run.append(entry)
+        elif (dt - current_ts_run[-1]).total_seconds() <= max_gap_seconds:
+            current_ts_run.append(dt)
+            current_entry_run.append(entry)
+        else:
+            clustered_ts_runs.append(current_ts_run)
+            clustered_entry_runs.append(current_entry_run)
+            current_ts_run = [dt]
+            current_entry_run = [entry]
+
+    if current_ts_run:
+        clustered_ts_runs.append(current_ts_run)
+        clustered_entry_runs.append(current_entry_run)
+
+    runs_info: list[dict[str, Any]] = []
     runs_per_day: dict[str, int] = {}
     run_start_times: list[datetime] = []
 
-    for run in runs:
-        start_t = run[0]
+    for i, run_entries in enumerate(clustered_entry_runs):
+        start_t = clustered_ts_runs[i][0]
+        end_t = clustered_ts_runs[i][-1]
         run_start_times.append(start_t)
         day_str = start_t.strftime("%Y-%m-%d")
         runs_per_day[day_str] = runs_per_day.get(day_str, 0) + 1
+
+        missing: list[str] = []
+        present: list[str] = []
+
+        for target in expected_targets:
+            label = format_target_label(*target)
+            if any(entry_matches_target(e, target) for e in run_entries):
+                present.append(label)
+            else:
+                missing.append(label)
+
+        # Flag incomplete if fewer files than expected or missing expected targets
+        is_incomplete = bool(missing) or (len(run_entries) < expected_files_per_run)
+
+        runs_info.append(
+            {
+                "run_index": i + 1,
+                "start_utc": start_t.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "end_utc": end_t.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "file_count": len(run_entries),
+                "expected_count": expected_files_per_run,
+                "is_incomplete": is_incomplete,
+                "status": "INCOMPLETE" if is_incomplete else "COMPLETE",
+                "missing": missing,
+                "present": present,
+            }
+        )
 
     intervals: list[dict[str, Any]] = []
     for i in range(len(run_start_times) - 1):
@@ -163,8 +358,9 @@ def compute_archive_status(
 
     last_fetch_utc = None
     age_hours = None
-    if timestamps:
-        latest_ts = max(timestamps)
+    all_timestamps = [dt for dt, _ in valid_entries]
+    if all_timestamps:
+        latest_ts = max(all_timestamps)
         last_fetch_utc = latest_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
         age_hours = round((current_time - latest_ts).total_seconds() / 3600.0, 2)
 
@@ -172,13 +368,16 @@ def compute_archive_status(
         "manifest_path": manifest_path,
         "exists": True,
         "total_entries": len(entries),
-        "runs_count": len(runs),
+        "runs_count": len(runs_info),
+        "expected_files_per_run": expected_files_per_run,
+        "runs": runs_info,
         "runs_per_day": runs_per_day,
         "intervals": intervals,
         "age_hours": age_hours,
         "last_fetch_utc": last_fetch_utc,
         "file_count": len(file_paths),
         "total_size_mb": round(total_size_mb, 2),
+        "log_status": log_status,
     }
 
 
@@ -191,6 +390,8 @@ def format_status_report(status: dict[str, Any]) -> str:
     lines.append(f"Manifest: {status['manifest_path']}")
     lines.append(f"Total manifest entries: {status['total_entries']}")
     lines.append(f"Total clustered runs: {status['runs_count']}")
+    if status.get("expected_files_per_run"):
+        lines.append(f"Expected files per run: {status['expected_files_per_run']}")
     lines.append(f"Total files recorded: {status['file_count']}")
     lines.append(f"Total storage size: {status['total_size_mb']:.2f} MB")
 
@@ -211,6 +412,25 @@ def format_status_report(status: dict[str, Any]) -> str:
         lines.append("  None")
 
     lines.append("")
+    lines.append("Clustered runs:")
+    if status.get("runs"):
+        for run in status["runs"]:
+            r_idx = run["run_index"]
+            s_utc = run["start_utc"]
+            cnt = run["file_count"]
+            exp = run["expected_count"]
+            if run["is_incomplete"]:
+                missing_str = (
+                    ", ".join(run["missing"]) if run["missing"] else "unspecified"
+                )
+                prefix = f"  Run {r_idx} ({s_utc}): {cnt}/{exp} files [INCOMPLETE]"
+                lines.append(f"{prefix} (missing: {missing_str})")
+            else:
+                lines.append(f"  Run {r_idx} ({s_utc}): {cnt}/{exp} files")
+    else:
+        lines.append("  None")
+
+    lines.append("")
     lines.append("Intervals between consecutive runs:")
     if status["intervals"]:
         for item in status["intervals"]:
@@ -226,6 +446,25 @@ def format_status_report(status: dict[str, Any]) -> str:
         else:
             lines.append("  None")
 
+    if status.get("log_status"):
+        log_info = status["log_status"]
+        lines.append("")
+        lines.append("Run log status:")
+        lines.append(f"  Log file: {log_info['log_path']}")
+        if not log_info["exists"]:
+            lines.append("  File does not exist.")
+        elif log_info["total_lines"] == 0:
+            lines.append("  File is empty.")
+        else:
+            lines.append(f"  Total starts: {log_info['total_starts']}")
+            if log_info["unmatched_starts"]:
+                for item in log_info["unmatched_starts"]:
+                    lines.append(
+                        f'  Line {item["line_num"]}: "{item["line"]}" [{item["flag"]}]'
+                    )
+            else:
+                lines.append("  All starts have matching exit= (clean).")
+
     lines.append("=" * 60)
     return "\n".join(lines)
 
@@ -238,6 +477,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--manifest",
         default="data/raw/open_meteo/manifest.jsonl",
         help="Path to manifest.jsonl (default: data/raw/open_meteo/manifest.jsonl).",
+    )
+    parser.add_argument(
+        "--areas",
+        default="configs/areas.json",
+        help="Path to areas.json (default: configs/areas.json).",
+    )
+    parser.add_argument(
+        "--vars",
+        default="configs/variables.json",
+        help="Path to variables.json (default: configs/variables.json).",
+    )
+    parser.add_argument(
+        "--log",
+        default=None,
+        help="Path to execution run.log to audit for unclosed starts.",
     )
     parser.add_argument(
         "--now",
@@ -267,8 +521,11 @@ def main(argv: list[str] | None = None) -> None:
 
     status = compute_archive_status(
         manifest_path=args.manifest,
+        areas_path=args.areas,
+        vars_path=args.vars,
         now_utc=now_utc,
         gap_threshold_hours=args.gap_hours,
+        log_path=args.log,
     )
     print(format_status_report(status))
 
