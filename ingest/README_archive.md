@@ -44,22 +44,31 @@ Raw payloads are stored under `data/raw/open_meteo/`:
 
 - **`data/raw/open_meteo/failures.jsonl`**: Records any client errors (e.g., HTTP 400), server errors, or validation errors (missing `hourly.time` or requested variables). Invalid responses are never saved to the archive.
 
-## Archive Health Monitoring (WP1, WP2b)
+## Archive Health Monitoring (WP1, WP2b, WP2c)
 
 The script `scripts/status_archive.py` reads `manifest.jsonl` and reports:
-1. **Runs per day**: Grouped by UTC date, where fetches within 10 minutes are clustered into one run.
-2. **Completeness per clustered run**: Computes expected files per run as:
-   $$\text{Expected Files} = \text{number of areas} \times (1\text{ CAMS} + \text{number of configured weather models})$$
-   read directly from `configs/areas.json` and `configs/variables.json` (e.g., $5 \times (1 + 2) = 15$ files per run).
-   If a clustered run has fewer files than expected, it is flagged **`[INCOMPLETE]`** along with the list of missing source/area targets (e.g. `cams/noida`, `weather[ncep_gfs_seamless]/faridabad`).
+1. **Runs per day & time span**: Grouped by UTC date, where fetches within 10 minutes are clustered into one run. Each run reports its start and end UTC timestamps: `Run <id> (<start_utc> -> <end_utc>): <count>/<expected> files`.
+2. **Completeness per clustered run**:
+   - **Current Runs**: Expected files = $\text{areas} \times (1\text{ CAMS} + \text{configured weather models})$ (e.g., $5 \times (1 + 2) = 15$ files).
+   - **Legacy Runs (`[LEGACY LAYOUT]`)**: Runs where no entry contains a `model` field (pre-pinning) expect $\text{areas} \times 2$ files (`cams` + default `weather`). These are labelled `[LEGACY LAYOUT]` instead of `[INCOMPLETE]`.
+   - **Target-level auditing**: A run is never flagged `[INCOMPLETE]` when `files >= expected` unless a named target is actually missing. Only missing targets are reported.
 3. **Hours between consecutive runs & GAP alerts**: Time elapsed between runs. Any interval exceeding 7.0 hours is flagged **`[GAP]`**.
 4. **Age of last fetch**: Elapsed hours since the most recent fetch timestamp.
 5. **File counts and storage size**: Total files recorded and total size in MB on disk.
 6. **Execution log audit (`--log <run.log>`)**: Scans execution logs to ensure clean job completion. Any `start` line lacking a matching `exit=` line before the next `start` or EOF is flagged **`[START WITHOUT EXIT]`**.
+7. **Date filtering (`--since <YYYY-MM-DD>`)**: Ignores manifest entries older than the specified UTC date.
+8. **Merged cross-archive audit (`--merge <path>`)**: Combines two manifests (e.g. local laptop and GitHub Actions `archive-data`), de-duplicates entries by `(area_id, source, model, fetch_time_utc)`, and checks every 6-hour UTC cycle window (`00:00`, `06:00`, `12:00`, `18:00`) since `--since`. Any cycle with zero data across both sources is flagged **`[NO DATA]`**.
 
 Usage:
 ```bash
+# Basic check
 python scripts/status_archive.py --manifest data/raw/open_meteo/manifest.jsonl --log run.log
+
+# Filter recent runs since a given date
+python scripts/status_archive.py --manifest data/raw/open_meteo/manifest.jsonl --since 2026-11-20
+
+# Dual-manifest audit merging local and actions archives
+python scripts/status_archive.py --manifest data/raw/open_meteo/manifest.jsonl --merge archive-data/manifest.jsonl --since 2026-11-20
 ```
 
 ## GitHub Actions Automated Archive (WP2, WP2b)

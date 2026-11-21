@@ -304,7 +304,7 @@ def test_hand_made_manifest_complete_run(tmp_path: Any) -> None:
 
     report = format_status_report(status)
     assert "Expected files per run: 6" in report
-    assert "Run 1 (2026-11-20T01:17:00Z): 6/6 files" in report
+    assert "Run 1 (2026-11-20T01:17:00Z -> 2026-11-20T01:17:05Z): 6/6 files" in report
     assert "[INCOMPLETE]" not in report
 
 
@@ -459,3 +459,255 @@ def test_hand_made_log_empty(tmp_path: Any) -> None:
     report = format_status_report(status)
     assert "File is empty." in report
     assert "[START WITHOUT EXIT]" not in report
+
+
+def test_legacy_layout_run_labeled_not_incomplete(tmp_path: Any) -> None:
+    """Clustered run without model field is labeled [LEGACY LAYOUT], not INCOMPLETE."""
+    areas_cfg = tmp_path / "areas.json"
+    vars_cfg = tmp_path / "vars.json"
+    manifest_file = tmp_path / "manifest.jsonl"
+
+    areas_cfg.write_text(
+        json.dumps(
+            {
+                "areas": [
+                    {"area_id": "area_1"},
+                    {"area_id": "area_2"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    vars_cfg.write_text(
+        json.dumps(
+            {
+                "weather": {
+                    "models": [
+                        {"model": "ecmwf_ifs025"},
+                        {"model": "ncep_gfs_seamless"},
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Legacy entries omit 'model' field; expect 2 areas * 2 = 4 files
+    entries = [
+        {
+            "fetch_time_utc": "2026-11-19T00:00:00Z",
+            "source": "cams",
+            "area_id": "area_1",
+        },
+        {
+            "fetch_time_utc": "2026-11-19T00:00:01Z",
+            "source": "cams",
+            "area_id": "area_2",
+        },
+        {
+            "fetch_time_utc": "2026-11-19T00:00:02Z",
+            "source": "weather",
+            "area_id": "area_1",
+        },
+        {
+            "fetch_time_utc": "2026-11-19T00:00:03Z",
+            "source": "weather",
+            "area_id": "area_2",
+        },
+    ]
+    with open(manifest_file, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+    status = compute_archive_status(
+        manifest_path=str(manifest_file),
+        areas_path=str(areas_cfg),
+        vars_path=str(vars_cfg),
+    )
+
+    assert status["runs_count"] == 1
+    run1 = status["runs"][0]
+    assert run1["is_legacy"] is True
+    assert run1["is_incomplete"] is False
+    assert run1["expected_count"] == 4
+    assert run1["file_count"] == 4
+    assert run1["status"] == "LEGACY"
+
+    report = format_status_report(status)
+    assert "[LEGACY LAYOUT]" in report
+    assert "[INCOMPLETE]" not in report
+    assert "2026-11-19T00:00:00Z -> 2026-11-19T00:00:03Z" in report
+
+
+def test_files_ge_expected_incomplete_only_when_target_missing(
+    tmp_path: Any,
+) -> None:
+    """When file_count >= expected, flag INCOMPLETE only if named target is missing."""
+    areas_cfg = tmp_path / "areas.json"
+    vars_cfg = tmp_path / "vars.json"
+    manifest_file = tmp_path / "manifest.jsonl"
+
+    areas_cfg.write_text(
+        json.dumps({"areas": [{"area_id": "delhi"}]}),
+        encoding="utf-8",
+    )
+    vars_cfg.write_text(
+        json.dumps({"weather": {"models": [{"model": "ecmwf_ifs025"}]}}),
+        encoding="utf-8",
+    )
+    # Expected: 1 area * (1 cams + 1 weather) = 2 files
+
+    # Case: 2 files, but both are cams/delhi; weather[ecmwf_ifs025]/delhi is missing
+    entries = [
+        {
+            "fetch_time_utc": "2026-11-20T00:00:00Z",
+            "source": "cams",
+            "area_id": "delhi",
+            "model": "default",
+        },
+        {
+            "fetch_time_utc": "2026-11-20T00:00:01Z",
+            "source": "cams",
+            "area_id": "delhi",
+            "model": "default",
+        },
+    ]
+    with open(manifest_file, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+    status = compute_archive_status(
+        manifest_path=str(manifest_file),
+        areas_path=str(areas_cfg),
+        vars_path=str(vars_cfg),
+    )
+
+    run = status["runs"][0]
+    assert run["file_count"] == 2
+    assert run["expected_count"] == 2
+    assert run["is_incomplete"] is True
+    assert run["missing"] == ["weather[ecmwf_ifs025]/delhi"]
+
+    report = format_status_report(status)
+    assert "[INCOMPLETE]" in report
+    assert "missing: weather[ecmwf_ifs025]/delhi" in report
+    assert "cams/delhi" not in report.split("missing:")[1]
+
+
+def test_since_option_filters_older_entries(tmp_path: Any) -> None:
+    """--since <YYYY-MM-DD> ignores older entries."""
+    manifest_file = tmp_path / "manifest.jsonl"
+
+    entries = [
+        {
+            "fetch_time_utc": "2026-11-18T23:55:00Z",
+            "source": "cams",
+            "area_id": "delhi",
+            "model": "default",
+        },
+        {
+            "fetch_time_utc": "2026-11-19T01:17:00Z",
+            "source": "cams",
+            "area_id": "delhi",
+            "model": "default",
+        },
+        {
+            "fetch_time_utc": "2026-11-20T01:17:00Z",
+            "source": "cams",
+            "area_id": "delhi",
+            "model": "default",
+        },
+    ]
+    with open(manifest_file, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+    # Without since: 3 entries, 3 runs
+    s_all = compute_archive_status(str(manifest_file))
+    assert s_all["total_entries"] == 3
+    assert s_all["runs_count"] == 3
+
+    # With since="2026-11-19": ignores 2026-11-18 entry
+    s_since = compute_archive_status(str(manifest_file), since="2026-11-19")
+    assert s_since["total_entries"] == 2
+    assert s_since["runs_count"] == 2
+    assert "2026-11-18" not in s_since["runs_per_day"]
+    assert "2026-11-19" in s_since["runs_per_day"]
+    assert "2026-11-20" in s_since["runs_per_day"]
+
+
+def test_merge_two_manifests_deduplication_and_missing_6h_windows(
+    tmp_path: Any,
+) -> None:
+    """--merge combines manifests, deduplicates, and flags 6h windows."""
+    man1 = tmp_path / "manifest_laptop.jsonl"
+    man2 = tmp_path / "manifest_actions.jsonl"
+
+    # Reference evaluation time: 2026-11-20 20:00 UTC
+    ref_now = datetime(2026, 11, 20, 20, 0, 0, tzinfo=UTC)
+
+    # Window 00 (00-06 UTC): Laptop at 01:17, Actions also at 01:17 (duplicate)
+    # Window 06 (06-12 UTC): Laptop has data at 07:17
+    # Window 12 (12-18 UTC): NO DATA in either manifest!
+    # Window 18 (18-24 UTC): Actions has data at 19:17
+    entries_laptop = [
+        {
+            "fetch_time_utc": "2026-11-20T01:17:00Z",
+            "source": "cams",
+            "area_id": "delhi",
+            "model": "default",
+        },
+        {
+            "fetch_time_utc": "2026-11-20T07:17:00Z",
+            "source": "cams",
+            "area_id": "delhi",
+            "model": "default",
+        },
+    ]
+    entries_actions = [
+        {
+            "fetch_time_utc": "2026-11-20T01:17:00Z",
+            "source": "cams",
+            "area_id": "delhi",
+            "model": "default",
+        },
+        {
+            "fetch_time_utc": "2026-11-20T19:17:00Z",
+            "source": "cams",
+            "area_id": "delhi",
+            "model": "default",
+        },
+    ]
+
+    with open(man1, "w", encoding="utf-8") as f:
+        for e in entries_laptop:
+            f.write(json.dumps(e) + "\n")
+    with open(man2, "w", encoding="utf-8") as f:
+        for e in entries_actions:
+            f.write(json.dumps(e) + "\n")
+
+    status = compute_archive_status(
+        manifest_path=str(man1),
+        merge_manifest_path=str(man2),
+        since="2026-11-20",
+        now_utc=ref_now,
+    )
+
+    m_info = status["merge_info"]
+    assert m_info is not None
+    assert m_info["primary_entries"] == 2
+    assert m_info["merge_entries"] == 2
+    # 2 + 2 - 1 duplicate = 3 unique entries
+    assert m_info["deduped_entries"] == 3
+
+    # Check missing windows: only Window 12 (12:00 to 18:00) is missing
+    missing_windows = m_info["missing_windows"]
+    assert len(missing_windows) == 1
+    assert missing_windows[0]["hour"] == 12
+    assert missing_windows[0]["date"] == "2026-11-20"
+
+    report = format_status_report(status)
+    assert "Merged manifests view:" in report
+    assert "De-duplicated total entries: 3" in report
+    assert "2026-11-20 12:00 UTC (12:00 - 18:00) [NO DATA]" in report
+    assert "00:00" not in report.split("Missing 6-hour UTC windows")[1]

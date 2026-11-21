@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 
@@ -171,6 +171,118 @@ def parse_run_log(log_path: str) -> dict[str, Any]:
     }
 
 
+def load_manifest_file(
+    manifest_path: str,
+    since_dt: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Load JSONL manifest entries, optionally filtering entries before since_dt."""
+    if not os.path.exists(manifest_path):
+        return []
+
+    entries: list[dict[str, Any]] = []
+    with open(manifest_path, encoding="utf-8") as f:
+        for line in f:
+            line_str = line.strip()
+            if not line_str:
+                continue
+            try:
+                entry = json.loads(line_str)
+            except json.JSONDecodeError:
+                continue
+
+            ts_str = entry.get("fetch_time_utc")
+            if ts_str and since_dt:
+                try:
+                    dt = parse_iso_utc(ts_str)
+                    if dt < since_dt:
+                        continue
+                except ValueError:
+                    pass
+
+            entries.append(entry)
+
+    return entries
+
+
+def deduplicate_manifest_entries(
+    entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """De-duplicate entries by (area_id, source, model, fetch_time_utc)."""
+    seen: set[tuple[str, str, str, str]] = set()
+    deduped: list[dict[str, Any]] = []
+
+    for entry in entries:
+        aid = str(entry.get("area_id", ""))
+        src = str(entry.get("source", ""))
+        mdl = str(entry.get("model", "default"))
+        ts_str = entry.get("fetch_time_utc", "")
+        if ts_str:
+            try:
+                norm_ts = parse_iso_utc(ts_str).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except ValueError:
+                norm_ts = str(ts_str)
+        else:
+            norm_ts = ""
+
+        key = (aid, src, mdl, norm_ts)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(entry)
+
+    return deduped
+
+
+def find_missing_6h_windows(
+    entries: list[dict[str, Any]],
+    since_dt: datetime,
+    until_dt: datetime,
+) -> list[dict[str, Any]]:
+    """Find 6-hour UTC windows (00, 06, 12, 18) with no entries up to until_dt."""
+    timestamps: list[datetime] = []
+    for e in entries:
+        ts_str = e.get("fetch_time_utc")
+        if ts_str:
+            try:
+                timestamps.append(parse_iso_utc(ts_str))
+            except ValueError:
+                pass
+
+    # Align start window to the 6h boundary of since_dt date
+    start_window = datetime(
+        since_dt.year,
+        since_dt.month,
+        since_dt.day,
+        (since_dt.hour // 6) * 6,
+        0,
+        0,
+        tzinfo=UTC,
+    )
+
+    missing_windows: list[dict[str, Any]] = []
+    curr = start_window
+    window_delta = timedelta(hours=6)
+
+    while curr <= until_dt:
+        window_end = curr + window_delta
+        has_data = any(curr <= ts < window_end for ts in timestamps)
+        if not has_data:
+            missing_windows.append(
+                {
+                    "window_start_utc": curr.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "window_end_utc": window_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "date": curr.strftime("%Y-%m-%d"),
+                    "hour": curr.hour,
+                    "label": (
+                        f"{curr.strftime('%Y-%m-%d')} {curr.strftime('%H:00')} UTC "
+                        f"({curr.strftime('%H:00')} - {window_end.strftime('%H:00')})"
+                    ),
+                }
+            )
+        curr = window_end
+
+    return missing_windows
+
+
 def compute_archive_status(
     manifest_path: str,
     areas_path: str = "configs/areas.json",
@@ -179,9 +291,15 @@ def compute_archive_status(
     gap_threshold_hours: float = 7.0,
     run_gap_minutes: float = 10.0,
     log_path: str | None = None,
+    since: str | None = None,
+    merge_manifest_path: str | None = None,
 ) -> dict[str, Any]:
-    """Compute archive health, completeness, and continuity metrics."""
+    """Compute archive health, completeness, legacy, and continuity metrics."""
     current_time = now_utc or datetime.now(UTC)
+
+    since_dt: datetime | None = None
+    if since:
+        since_dt = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=UTC)
 
     areas, weather_models = load_forecast_configs(areas_path, vars_path)
     expected_files_per_run = len(areas) * (1 + len(weather_models)) if areas else 0
@@ -189,7 +307,57 @@ def compute_archive_status(
 
     log_status = parse_run_log(log_path) if log_path else None
 
-    if not os.path.exists(manifest_path):
+    primary_exists = os.path.exists(manifest_path)
+    primary_entries = load_manifest_file(manifest_path, since_dt=since_dt)
+
+    merge_info: dict[str, Any] | None = None
+    if merge_manifest_path:
+        second_entries = load_manifest_file(merge_manifest_path, since_dt=since_dt)
+        all_entries = primary_entries + second_entries
+        deduped_entries = deduplicate_manifest_entries(all_entries)
+
+        # 6-hour windows check
+        # Use since_dt or earliest entry date
+        ref_start_dt = since_dt
+        if ref_start_dt is None:
+            entry_ts_list = []
+            for e in deduped_entries:
+                ts = e.get("fetch_time_utc")
+                if ts:
+                    try:
+                        entry_ts_list.append(parse_iso_utc(ts))
+                    except ValueError:
+                        pass
+            if entry_ts_list:
+                min_dt = min(entry_ts_list)
+                ref_start_dt = datetime(
+                    min_dt.year, min_dt.month, min_dt.day, tzinfo=UTC
+                )
+            else:
+                ref_start_dt = current_time.replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+
+        missing_windows = find_missing_6h_windows(
+            entries=deduped_entries,
+            since_dt=ref_start_dt,
+            until_dt=current_time,
+        )
+
+        merge_info = {
+            "primary_path": manifest_path,
+            "primary_entries": len(primary_entries),
+            "merge_path": merge_manifest_path,
+            "merge_entries": len(second_entries),
+            "deduped_entries": len(deduped_entries),
+            "since": since,
+            "missing_windows": missing_windows,
+        }
+        entries = deduped_entries
+    else:
+        entries = primary_entries
+
+    if not primary_exists and not merge_manifest_path:
         return {
             "manifest_path": manifest_path,
             "exists": False,
@@ -204,23 +372,14 @@ def compute_archive_status(
             "file_count": 0,
             "total_size_mb": 0.0,
             "log_status": log_status,
+            "since": since,
+            "merge_info": merge_info,
         }
-
-    entries: list[dict[str, Any]] = []
-    with open(manifest_path, encoding="utf-8") as f:
-        for line in f:
-            line_str = line.strip()
-            if not line_str:
-                continue
-            try:
-                entries.append(json.loads(line_str))
-            except json.JSONDecodeError:
-                continue
 
     if not entries:
         return {
             "manifest_path": manifest_path,
-            "exists": True,
+            "exists": primary_exists,
             "total_entries": 0,
             "runs_count": 0,
             "expected_files_per_run": expected_files_per_run,
@@ -232,6 +391,8 @@ def compute_archive_status(
             "file_count": 0,
             "total_size_mb": 0.0,
             "log_status": log_status,
+            "since": since,
+            "merge_info": merge_info,
         }
 
     valid_entries: list[tuple[datetime, dict[str, Any]]] = []
@@ -312,32 +473,72 @@ def compute_archive_status(
         day_str = start_t.strftime("%Y-%m-%d")
         runs_per_day[day_str] = runs_per_day.get(day_str, 0) + 1
 
-        missing: list[str] = []
-        present: list[str] = []
-
-        for target in expected_targets:
-            label = format_target_label(*target)
-            if any(entry_matches_target(e, target) for e in run_entries):
-                present.append(label)
-            else:
-                missing.append(label)
-
-        # Flag incomplete if fewer files than expected or missing expected targets
-        is_incomplete = bool(missing) or (len(run_entries) < expected_files_per_run)
-
-        runs_info.append(
-            {
-                "run_index": i + 1,
-                "start_utc": start_t.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "end_utc": end_t.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "file_count": len(run_entries),
-                "expected_count": expected_files_per_run,
-                "is_incomplete": is_incomplete,
-                "status": "INCOMPLETE" if is_incomplete else "COMPLETE",
-                "missing": missing,
-                "present": present,
-            }
+        # Check legacy layout: none of its lines has a "model" field
+        is_legacy = not any(
+            "model" in e and e["model"] is not None for e in run_entries
         )
+
+        if is_legacy:
+            # Legacy runs expect cams + default weather = areas x 2 files
+            expected_count = len(areas) * 2 if areas else 0
+            legacy_targets = []
+            for area in areas:
+                legacy_targets.append(("cams", "default", area))
+                legacy_targets.append(("weather", "default", area))
+
+            missing: list[str] = []
+            present: list[str] = []
+            for target in legacy_targets:
+                label = format_target_label(*target)
+                if any(entry_matches_target(e, target) for e in run_entries):
+                    present.append(label)
+                else:
+                    missing.append(label)
+
+            is_incomplete = bool(missing) or (len(run_entries) < expected_count)
+            status_str = "LEGACY_INCOMPLETE" if is_incomplete else "LEGACY"
+
+            runs_info.append(
+                {
+                    "run_index": i + 1,
+                    "start_utc": start_t.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "end_utc": end_t.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "file_count": len(run_entries),
+                    "expected_count": expected_count,
+                    "is_legacy": True,
+                    "is_incomplete": is_incomplete,
+                    "status": status_str,
+                    "missing": missing,
+                    "present": present,
+                }
+            )
+        else:
+            missing = []
+            present = []
+            for target in expected_targets:
+                label = format_target_label(*target)
+                if any(entry_matches_target(e, target) for e in run_entries):
+                    present.append(label)
+                else:
+                    missing.append(label)
+
+            # Never print INCOMPLETE when files >= expected unless target is missing
+            is_incomplete = bool(missing) or (len(run_entries) < expected_files_per_run)
+
+            runs_info.append(
+                {
+                    "run_index": i + 1,
+                    "start_utc": start_t.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "end_utc": end_t.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "file_count": len(run_entries),
+                    "expected_count": expected_files_per_run,
+                    "is_legacy": False,
+                    "is_incomplete": is_incomplete,
+                    "status": "INCOMPLETE" if is_incomplete else "COMPLETE",
+                    "missing": missing,
+                    "present": present,
+                }
+            )
 
     intervals: list[dict[str, Any]] = []
     for i in range(len(run_start_times) - 1):
@@ -378,6 +579,8 @@ def compute_archive_status(
         "file_count": len(file_paths),
         "total_size_mb": round(total_size_mb, 2),
         "log_status": log_status,
+        "since": since,
+        "merge_info": merge_info,
     }
 
 
@@ -388,6 +591,8 @@ def format_status_report(status: dict[str, Any]) -> str:
     lines.append("Open-Meteo Forecast Archive Status Report")
     lines.append("=" * 60)
     lines.append(f"Manifest: {status['manifest_path']}")
+    if status.get("since"):
+        lines.append(f"Filter since: {status['since']}")
     lines.append(f"Total manifest entries: {status['total_entries']}")
     lines.append(f"Total clustered runs: {status['runs_count']}")
     if status.get("expected_files_per_run"):
@@ -417,16 +622,36 @@ def format_status_report(status: dict[str, Any]) -> str:
         for run in status["runs"]:
             r_idx = run["run_index"]
             s_utc = run["start_utc"]
+            e_utc = run["end_utc"]
             cnt = run["file_count"]
             exp = run["expected_count"]
-            if run["is_incomplete"]:
-                missing_str = (
-                    ", ".join(run["missing"]) if run["missing"] else "unspecified"
-                )
-                prefix = f"  Run {r_idx} ({s_utc}): {cnt}/{exp} files [INCOMPLETE]"
-                lines.append(f"{prefix} (missing: {missing_str})")
+            time_span = f"({s_utc} -> {e_utc})"
+
+            if run.get("is_legacy"):
+                if run["is_incomplete"]:
+                    missing_str = (
+                        ", ".join(run["missing"]) if run["missing"] else "unspecified"
+                    )
+                    prefix = (
+                        f"  Run {r_idx} {time_span}: {cnt}/{exp} files "
+                        "[LEGACY LAYOUT] [INCOMPLETE]"
+                    )
+                    lines.append(f"{prefix} (missing: {missing_str})")
+                else:
+                    lines.append(
+                        f"  Run {r_idx} {time_span}: {cnt}/{exp} files [LEGACY LAYOUT]"
+                    )
             else:
-                lines.append(f"  Run {r_idx} ({s_utc}): {cnt}/{exp} files")
+                if run["is_incomplete"]:
+                    missing_str = (
+                        ", ".join(run["missing"]) if run["missing"] else "unspecified"
+                    )
+                    prefix = (
+                        f"  Run {r_idx} {time_span}: {cnt}/{exp} files [INCOMPLETE]"
+                    )
+                    lines.append(f"{prefix} (missing: {missing_str})")
+                else:
+                    lines.append(f"  Run {r_idx} {time_span}: {cnt}/{exp} files")
     else:
         lines.append("  None")
 
@@ -445,6 +670,28 @@ def format_status_report(status: dict[str, Any]) -> str:
             lines.append("  Fewer than 2 runs recorded, no intervals to display.")
         else:
             lines.append("  None")
+
+    if status.get("merge_info"):
+        m_info = status["merge_info"]
+        lines.append("")
+        lines.append("Merged manifests view:")
+        lines.append(
+            f"  Primary: {m_info['primary_path']} ({m_info['primary_entries']} entries)"
+        )
+        lines.append(
+            f"  Merged with: {m_info['merge_path']} ({m_info['merge_entries']} entries)"
+        )
+        lines.append(f"  De-duplicated total entries: {m_info['deduped_entries']}")
+        if m_info.get("since"):
+            lines.append(f"  Since date: {m_info['since']}")
+
+        lines.append("")
+        lines.append("Missing 6-hour UTC windows (00, 06, 12, 18) with no data:")
+        if m_info["missing_windows"]:
+            for win in m_info["missing_windows"]:
+                lines.append(f"  - {win['label']} [NO DATA]")
+        else:
+            lines.append("  None (all 6-hour windows have data).")
 
     if status.get("log_status"):
         log_info = status["log_status"]
@@ -494,6 +741,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to execution run.log to audit for unclosed starts.",
     )
     parser.add_argument(
+        "--since",
+        default=None,
+        help="Ignore entries fetched before date YYYY-MM-DD.",
+    )
+    parser.add_argument(
+        "--merge",
+        default=None,
+        help=(
+            "Path to second manifest.jsonl to merge, de-duplicate, and check "
+            "for missing 6-hour UTC windows."
+        ),
+    )
+    parser.add_argument(
         "--now",
         default=None,
         help=(
@@ -526,6 +786,8 @@ def main(argv: list[str] | None = None) -> None:
         now_utc=now_utc,
         gap_threshold_hours=args.gap_hours,
         log_path=args.log,
+        since=args.since,
+        merge_manifest_path=args.merge,
     )
     print(format_status_report(status))
 
