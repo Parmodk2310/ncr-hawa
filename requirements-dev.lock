@@ -5,3 +5,4 @@ pluggy==1.7.0
 Pygments==2.21.0
 pytest==9.2.0
 ruff==0.17.5
+tzdata==2026.6
