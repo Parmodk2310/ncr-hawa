@@ -1,0 +1,60 @@
+name: Cloud Archive Health Check
+
+'on':
+  schedule:
+    # Scheduled once a day at 02:23 UTC (odd minute).
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out main repository
+        # TODO: Verify actions/checkout version on its official releases page (sandboxed environment has no network)
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: main
+
+      - name: Check out archive-data branch
+        # TODO: Verify actions/checkout version on its official releases page (sandboxed environment has no network)
+        uses: actions/checkout@v7
+        with:
+          ref: archive-data
+          path: archive-data
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Run archive health check script
+        id: run-health
+        continue-on-error: true
+        run: |
+          mkdir -p reports
+          python -m scripts.archive_health --manifest archive-data/open_meteo/manifest.jsonl --output reports/health_report.txt
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Create or update issue if archive is stale
+        if: steps.run-health.outcome != 'success' || steps.run-health.outputs.exit_code != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Note [Unverified]: The gh CLI being preinstalled on the runner is unverified: if it is missing, the job must simply fail.
+          REPORT_BODY=$(cat reports/health_report.txt 2>/dev/null || echo "Archive health check failed with non-zero exit code.")
+          EXISTING_ISSUE=$(gh issue list --state open --search "Archive stale" --json number --jq '.[0].number')
+          if [ -n "$EXISTING_ISSUE" ]; then
+            echo "Updating existing open issue #$EXISTING_ISSUE with latest health check report..."
+            gh issue comment "$EXISTING_ISSUE" --body "$REPORT_BODY"
+          else
+            echo "Opening new issue titled 'Archive stale'..."
+            gh issue create --title "Archive stale" --body "$REPORT_BODY"
+          fi

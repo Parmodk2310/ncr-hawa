@@ -21,16 +21,21 @@ jobs:
 
     steps:
       - name: Check out main repository
-        # Verified latest release: v7.0.1 (https://github.com/actions/checkout/releases/tag/v7.0.1)
+        # TODO: Verify actions/checkout version on its official releases page (sandboxed environment has no network)
         uses: actions/checkout@v7
         with:
           ref: main
 
+      - name: Record workflow start time
+        id: record-start
+        run: |
+          START_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "start_time=$START_TIME" >> $GITHUB_OUTPUT
+          echo "START_TIME=$START_TIME" >> $GITHUB_ENV
+
       - name: Check out archive-data branch into subfolder
-        # Verified latest release: v7.0.1 (https://github.com/actions/checkout/releases/tag/v7.0.1)
+        # TODO: Verify actions/checkout version on its official releases page (sandboxed environment has no network)
         uses: actions/checkout@v7
-        continue-on-error: true
-        id: checkout-archive-data
         with:
           ref: archive-data
           path: archive-data
@@ -58,6 +63,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          PUSH_STATUS="skipped"
+          FILES_COMMITTED=0
           if [ -d "archive-data" ]; then
             cd archive-data
             git config --global --add safe.directory "*"
@@ -71,13 +78,22 @@ jobs:
             git add .
             if git diff --staged --quiet; then
               echo "No new files to commit."
+              PUSH_STATUS="up-to-date (no new files)"
             else
+              FILES_COMMITTED=$(git diff --staged --name-only | wc -l)
               git commit -m "data(archive): save Open-Meteo forecasts [skip ci]"
-              git push -u origin archive-data
+              if git push -u origin archive-data; then
+                PUSH_STATUS="success"
+              else
+                PUSH_STATUS="failed"
+              fi
             fi
           else
             echo "archive-data directory not found, skipping push."
+            PUSH_STATUS="failed (archive-data missing)"
           fi
+          echo "push_status=$PUSH_STATUS" >> $GITHUB_ENV
+          echo "files_committed=$FILES_COMMITTED" >> $GITHUB_ENV
 
       - name: Report archive-data commit status
         if: always()
@@ -94,3 +110,15 @@ jobs:
           else
             echo "archive-data git repository not found."
           fi
+
+      - name: Write GitHub Step Summary
+        if: always()
+        run: |
+          echo "## Open-Meteo Forecast Archive Run Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Event Trigger** | \`${{ github.event_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Start Time (UTC)** | \`${{ env.START_TIME || 'unknown' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Files Committed** | \`${{ env.files_committed || '0' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Push Succeeded** | \`${{ env.push_status || 'unknown' }}\` |" >> $GITHUB_STEP_SUMMARY

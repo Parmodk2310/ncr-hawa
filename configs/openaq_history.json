@@ -1,0 +1,6 @@
+{
+  "from_date": "2024-01-01",
+  "window_days": 35,
+  "request_spacing": 1.1,
+  "max_requests_per_run": 1200
+}

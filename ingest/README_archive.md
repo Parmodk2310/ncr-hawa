@@ -44,8 +44,9 @@ Raw payloads are stored under `data/raw/open_meteo/`:
 
 - **`data/raw/open_meteo/failures.jsonl`**: Records any client errors (e.g., HTTP 400), server errors, or validation errors (missing `hourly.time` or requested variables). Invalid responses are never saved to the archive.
 
-## Archive Health Monitoring (WP1, WP2b, WP2c)
+## Archive Health Monitoring & Alerting (WP1, WP2b, WP2c, WP5)
 
+### 1. Status Script (`scripts/status_archive.py`)
 The script `scripts/status_archive.py` reads `manifest.jsonl` and reports:
 1. **Runs per day & time span**: Grouped by UTC date, where fetches within 10 minutes are clustered into one run. Each run reports its start and end UTC timestamps: `Run <id> (<start_utc> -> <end_utc>): <count>/<expected> files`.
 2. **Completeness per clustered run**:
@@ -70,6 +71,28 @@ python scripts/status_archive.py --manifest data/raw/open_meteo/manifest.jsonl -
 # Dual-manifest audit merging local and actions archives
 python scripts/status_archive.py --manifest data/raw/open_meteo/manifest.jsonl --merge archive-data/manifest.jsonl --since 2026-11-20
 ```
+
+### 2. Standalone Health Check Script (`scripts/archive_health.py`)
+`scripts/archive_health.py` provides automated freshness and frequency verification with explicit threshold guards defined in `configs/archive_health.json`:
+- **Age of Last Fetch**: Hours elapsed since the most recent fetch. If `age > max_age_hours` (default: 14.0h), the archive is flagged stale.
+- **24-Hour Run Frequency**: Counts distinct runs (fetches clustered within 10 minutes) in the last 24 hours. If `runs_24h < min_runs_24h` (default: 3), the run frequency is flagged insufficient.
+- **48-Hour Missing 6h Windows**: Enumerates missing 6-hour UTC cycle windows (`00:00`, `06:00`, `12:00`, `18:00`) over the preceding 48 hours.
+- **Exit Code**: Exits 0 if healthy; exits 1 if stale or insufficient runs.
+
+Usage:
+```bash
+# Run health check against default manifest
+python scripts/archive_health.py
+
+# Run health check against archive-data branch manifest
+python scripts/archive_health.py --manifest archive-data/open_meteo/manifest.jsonl
+```
+
+### 3. Automated Daily Health Workflow (`.github/workflows/archive-health.yml`)
+- **Schedule**: Runs daily at `02:23 UTC` (odd minute) and supports manual `workflow_dispatch`.
+- **Workflow Action**: Checks out `archive-data` and `main`, executes `scripts/archive_health.py`, and if it exits 1, creates or updates an open issue titled `"Archive stale"` using the `gh` CLI with `GITHUB_TOKEN`.
+- **Note [Unverified]**: Preinstallation of the `gh` CLI on GitHub Actions runner images is an operational dependency; if missing, the job will fail.
+
 
 ## GitHub Actions Automated Archive (WP2, WP2b)
 
