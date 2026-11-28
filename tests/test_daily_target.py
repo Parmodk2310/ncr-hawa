@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from features.daily_target import (
+    TZ_IST,
     aggregate_and_write_daily_pm25,
     assign_ist_date,
     compute_daily_pm25_records,
@@ -224,3 +226,10 @@ def test_aggregate_and_write_daily_pm25_integration(tmp_path: Path) -> None:
     assert summary["station_days_total"] == 1
     assert summary["station_days_valid"] == 1
     assert daily_csv.exists()
+
+
+def test_ist_timezone_offset() -> None:
+    """Verify that TZ_IST provides a fixed UTC offset of +05:30."""
+    dt = datetime(2026, 11, 1, 12, 0, 0, tzinfo=UTC)
+    ist_dt = dt.astimezone(TZ_IST)
+    assert ist_dt.utcoffset() == timedelta(hours=5, minutes=30)

@@ -16,11 +16,17 @@ import csv
 import json
 import os
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any
-from zoneinfo import ZoneInfo
 
-TZ_IST = ZoneInfo("Asia/Kolkata")
+try:
+    from zoneinfo import ZoneInfo
+
+    TZ_IST: tzinfo = ZoneInfo("Asia/Kolkata")
+except Exception:
+    # Fallback for platforms without IANA tzdata (e.g. Windows without tzdata package).
+    # Indian Standard Time (IST) is strictly fixed at UTC+05:30 without DST.
+    TZ_IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 DEFAULT_MIN_HOURS_PER_DAY = 18
 
 
